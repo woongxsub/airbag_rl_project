@@ -1,0 +1,27 @@
+env:
+  headless: true
+  episode_steps: 60
+  sim_dt: 0.016667       # 1/60 초
+
+ppo:
+  lr: 3.0e-4
+  gamma: 0.99
+  clip: 0.2
+  epochs: 10
+  batch_size: 256        # 에피소드 수 (업데이트 주기)
+
+train:
+  total_episodes: 10000
+  save_interval: 500
+  log_interval: 50
+
+scenario:
+  angle_range: [0, 360]
+  speed_range: [20, 120]   # km/h
+  stiffness: ["concrete", "vehicle", "wood"]
+
+airbag:
+  timing_max_ms: 30.0
+  pressure_max_kpa: 600.0
+  pressure_opt_kpa: 300.0   # 감쇠 최대 지점 (추후 논문 수치로 교체)
+  damping_max: 0.75          # 추후 논문 수치로 교체
