@@ -1,10 +1,13 @@
-import argparse
 import os
+import sys
+import argparse
 import yaml
 import numpy as np
 
-# Isaac Sim은 반드시 SimulationApp을 가장 먼저 초기화해야 함
-from omni.isaac.kit import SimulationApp
+# ── Isaac Sim 부트스트랩 ─────────────────────────────────────────────────
+os.environ["OMNI_KIT_ACCEPT_EULA"] = "yes"
+sys.path.insert(0, "/workspace/isaacsim_env/lib/python3.12/site-packages")
+from isaacsim import SimulationApp
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--headless", action="store_true")
@@ -55,7 +58,7 @@ def run_baseline(episodes=200):
 def run_train():
     env = AirbagEnv(headless=args.headless)
     agent = PPOAgent(
-        state_dim=7,
+        state_dim=12,
         lr=cfg["ppo"]["lr"],
         gamma=cfg["ppo"]["gamma"],
         clip=cfg["ppo"]["clip"],

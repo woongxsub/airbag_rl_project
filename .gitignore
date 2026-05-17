@@ -1,7 +1,35 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
-results/models/
-results/logs/
-.DS_Store
 *.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual envs
+venv/
+.env
+
+# Isaac Sim / Omniverse cache
+_build/
+_repo/
+*.log
+omni_data/
+
+# Results / outputs
+results/plots/*.png
+results/*.csv
+results/*.json
+*.ckpt
+*.pth
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db

@@ -12,7 +12,7 @@ class MultiHeadActor(nn.Module):
     pressure→ Normal    (연속, 5개), deploy=0이면 gradient 마스킹
     """
 
-    def __init__(self, state_dim=7, hidden=128):
+    def __init__(self, state_dim=12, hidden=128):
         super().__init__()
         self.shared = nn.Sequential(
             nn.Linear(state_dim, hidden),
@@ -59,7 +59,7 @@ class MultiHeadActor(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, state_dim=7, hidden=128):
+    def __init__(self, state_dim=12, hidden=128):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden),
@@ -74,7 +74,7 @@ class Critic(nn.Module):
 
 
 class PPOAgent:
-    def __init__(self, state_dim=7, lr=3e-4, gamma=0.99, clip=0.2, epochs=10):
+    def __init__(self, state_dim=12, lr=3e-4, gamma=0.99, clip=0.2, epochs=10):
         self.actor = MultiHeadActor(state_dim)
         self.critic = Critic(state_dim)
         self.optimizer = optim.Adam(

@@ -1,134 +1,196 @@
+"""
+에어백 RL 환경 — Isaac Sim 6.0 / Python 3.12.
+"""
+
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
-from omni.isaac.core import World
+from isaacsim.core.api import World
+from isaacsim.core.api.objects import FixedCuboid
+from isaacsim.core.utils.rotations import euler_angles_to_quat
 
 from env.vehicle import Vehicle
-from env.human import Human
+from env.human import Human, SEAT_LOCAL
 from env.airbag import AirbagSystem
-from env.scenario import ScenarioSampler
-from rl.reward import compute_hic, compute_reward
+from env.scenario import ScenarioSampler, STATE_DIM, SPINE_TILT_MIN_DEG, SPINE_TILT_MAX_DEG
+from rl.reward import (
+    InjuryDataCollector,
+    compute_hic15, compute_chest_g, compute_chest_3ms_clip,
+    compute_chest_compression_mm, compute_femur_force_n, compute_nij,
+    compute_reward,
+)
 
+PHYSICS_DT      = 0.001
+CONTROL_DT      = 1.0 / 60.0
+COLLISION_STEPS = 60
+TIMING_MAX_MS   = 30.0
 
-SIM_DT = 1.0 / 60.0        # Isaac Sim 기본 스텝
-COLLISION_STEPS = 10        # 충돌 힘 적용 스텝 수
-EPISODE_STEPS = 60          # 에피소드 총 스텝 수
-TIMING_MAX_MS = 30.0
+WALL_DIST_M = 3.5
+WALL_SIZE   = np.array([0.5, 5.0, 3.0])
+WALL_POS_Z  = 1.5
 
 
 class AirbagEnv(gym.Env):
     """
-    State  : 7차원 (scenario 벡터)
+    State  : 12차원
     Action : 15차원 (에어백 5개 × [deploy, timing, pressure])
-             deploy  → 이산 (0/1), multi-head PPO에서 Categorical 처리
-             timing  → 연속 [0, 30] ms
-             pressure→ 연속 [0, 600] kPa
     """
 
-    def __init__(self, headless=True):
+    def __init__(self, headless: bool = True):
         super().__init__()
-        self.world = World(physics_dt=SIM_DT, stage_units_in_meters=1.0)
-        self.sampler = ScenarioSampler()
-        self.scenario = None
-
-        self.observation_space = spaces.Box(
-            low=0.0, high=1.0, shape=(7,), dtype=np.float32
+        self.world = World(
+            physics_dt=PHYSICS_DT,
+            rendering_dt=CONTROL_DT,
+            stage_units_in_meters=1.0,
         )
-        # deploy(5) + timing(5) + pressure(5) 모두 [0,1]로 정규화해서 넘김
-        # multi-head PPO가 내부에서 분리해서 처리
-        self.action_space = spaces.Box(
-            low=0.0, high=1.0, shape=(15,), dtype=np.float32
-        )
+        self.sampler   = ScenarioSampler()
+        self._rng      = np.random.default_rng()
+        self.scenario  = None
+        self.collector = InjuryDataCollector(human=None, physics_dt=PHYSICS_DT)
+        self._wall     = None
 
-        self._head_acc_history = []
+        self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(STATE_DIM,), dtype=np.float32)
+        self.action_space      = spaces.Box(low=0.0, high=1.0, shape=(15,), dtype=np.float32)
+
+    # ── reset ──────────────────────────────────────────────────────────
 
     def reset(self, seed=None, options=None):
         self.world.reset()
         self.scenario = self.sampler.sample()
 
-        self.vehicle = Vehicle(self.world)
+        angle_deg = self.scenario["angle"]
+        speed_kmh = self.scenario["speed"]
+
+        self.vehicle = Vehicle(self.world, position=(0.0, 0.0, 0.0))
+        self._place_wall(angle_deg)
+
+        human_world_pos = np.zeros(3) + SEAT_LOCAL
         self.human = Human(
             self.world,
+            base_position=human_world_pos,
             height=self.scenario["height"],
             weight=self.scenario["weight"],
         )
-        self.airbag_sys = AirbagSystem(self.human)
+        self.airbag_sys = AirbagSystem(self.world, self.human)
+
         self.world.reset()
 
-        self._head_acc_history = []
-        self._step = 0
+        self.human.initialize()
+        self.airbag_sys.reset()
 
+        # 착좌 자세 인가
+        spine_tilt_deg = float(self._rng.uniform(SPINE_TILT_MIN_DEG, SPINE_TILT_MAX_DEG))
+        self.human.set_sitting_posture(spine_tilt_deg=spine_tilt_deg)
+
+        # 관절 위치 PhysX 전파
+        self.world.step(render=False)
+
+        # Pre-crash snapshot
+        snapshot = self.human.measure_snapshot(vehicle_body=self.vehicle.body)
+        self.scenario.update({
+            "sitting_height":    snapshot["sitting_height"],
+            "head_pos":          snapshot["head_pos"],
+            "spine_tilt_deg":    snapshot["spine_tilt_deg"],
+            "head_to_steering":  snapshot["head_to_steering"],
+            "knee_to_dashboard": snapshot["knee_to_dashboard"],
+        })
+
+        # 초기 속도 부여
+        speed_ms  = speed_kmh / 3.6
+        angle_rad = np.deg2rad(angle_deg)
+        init_vel  = np.array([speed_ms * np.cos(angle_rad),
+                               speed_ms * np.sin(angle_rad), 0.0])
+        self.vehicle.body.set_linear_velocity(init_vel)
+        self.human.set_initial_velocity(init_vel)
+
+        # 센서 콜백 등록
+        self.collector.human = self.human
+        self.collector.reset()
+        try:
+            self.world.remove_physics_callback("collect_injury")
+        except Exception:
+            pass
+        self.world.add_physics_callback("collect_injury", self.collector.physics_callback)
+
+        self._step = 0
         obs = self.sampler.to_state_vector(self.scenario)
         return obs, {}
 
+    # ── step ───────────────────────────────────────────────────────────
+
     def step(self, action: np.ndarray):
-        # action 파싱 및 역정규화
         raw_actions = self._parse_action(action)
 
-        # 충돌 힘 적용 (초반 스텝만)
-        if self._step < COLLISION_STEPS:
-            self.vehicle.apply_collision_force(
-                self.scenario["angle"],
-                self.scenario["speed"],
-                self.scenario["stiffness"],
-            )
-
-        # 안전벨트
-        self.human.apply_seatbelt(self.scenario["seatbelt"])
-
-        # 타이밍에 맞는 에어백 전개
-        current_ms = self._step * SIM_DT * 1000.0
-        timed_actions = self._apply_timing_mask(raw_actions, current_ms)
-        self.airbag_sys.apply(timed_actions, self.scenario["angle"])
+        self.human.apply_seatbelt(self.scenario["seatbelt"], self.vehicle.body)
+        current_ms = self._step * CONTROL_DT * 1000.0
+        self.airbag_sys.apply(raw_actions, self.scenario["angle"], current_ms)
 
         self.world.step(render=False)
         self._step += 1
 
-        head_vel = self.human.get_head_acceleration()
-        self._head_acc_history.append(head_vel)
-
-        done = self._step >= EPISODE_STEPS
+        done   = self._step >= COLLISION_STEPS
         reward = 0.0
 
         if done:
-            hic = compute_hic(self._head_acc_history, SIM_DT)
+            dt          = PHYSICS_DT
+            hic15       = compute_hic15(self.collector.head_acc_g, dt)
+            chest_g     = compute_chest_g(self.collector.torso_acc_g)
+            chest_3ms   = compute_chest_3ms_clip(self.collector.torso_acc_g, dt)
+            compression = compute_chest_compression_mm(self.collector.torso_pos_history)
+            femur_n     = compute_femur_force_n(self.collector.thigh_acc_3d)
+            nij         = compute_nij(self.collector.head_acc_3d)
             deploy_flags = [raw_actions[i, 0] > 0.5 for i in range(5)]
+
             reward = compute_reward(
-                hic=hic,
-                chest_g=0.0,        # TODO: 흉부 가속도 측정 추가
-                chest_compression_mm=0.0,  # TODO: 압축량 측정 추가
-                femur_n=0.0,        # TODO: 대퇴부 힘 측정 추가
-                neck_n=0.0,         # TODO: 목 전단력 측정 추가
-                deploy_flags=deploy_flags,
+                hic15=hic15, chest_g=chest_g, chest_3ms=chest_3ms,
+                chest_compression_mm=compression, femur_n=femur_n,
+                nij=nij, deploy_flags=deploy_flags,
             )
 
         obs = self.sampler.to_state_vector(self.scenario)
         return obs, reward, done, False, {}
 
+    # ── 종료 ───────────────────────────────────────────────────────────
+
+    def close(self):
+        try:
+            self.world.remove_physics_callback("collect_injury")
+        except Exception:
+            pass
+        self.world.stop()
+
+    # ── 내부 ───────────────────────────────────────────────────────────
+
+    def _place_wall(self, angle_deg: float):
+        angle_rad = np.deg2rad(angle_deg)
+        wall_pos  = np.array([WALL_DIST_M * np.cos(angle_rad),
+                               WALL_DIST_M * np.sin(angle_rad), WALL_POS_Z])
+        wall_quat = euler_angles_to_quat(np.array([0.0, 0.0, np.deg2rad(angle_deg)]))
+
+        if self._wall is None and not self.world.scene.object_exists("collision_wall"):
+            self._wall = self.world.scene.add(
+                FixedCuboid(
+                    prim_path="/World/collision_wall",
+                    name="collision_wall",
+                    position=wall_pos,
+                    orientation=wall_quat,
+                    scale=WALL_SIZE,
+                    color=np.array([0.55, 0.55, 0.55]),
+                )
+            )
+        elif self._wall is None:
+            self._wall = self.world.scene.get_object("collision_wall")
+
+        if self._wall is not None:
+            self._wall.set_world_pose(position=wall_pos, orientation=wall_quat)
+
     def _parse_action(self, action: np.ndarray) -> np.ndarray:
-        """
-        action[0:5]  → deploy (0/1 threshold 0.5)
-        action[5:10] → timing [0, 30] ms
-        action[10:15]→ pressure [0, 600] kPa
-        반환: shape (5, 3)
-        """
         result = np.zeros((5, 3), dtype=np.float32)
         for i in range(5):
             deploy = float(action[i] > 0.5)
             result[i, 0] = deploy
             if deploy:
-                result[i, 1] = action[5 + i] * TIMING_MAX_MS
+                result[i, 1] = action[5  + i] * TIMING_MAX_MS
                 result[i, 2] = action[10 + i] * 600.0
-        # deploy=0이면 timing·pressure는 0으로 유지 (gradient 마스킹은 PPO단에서 처리)
         return result
-
-    def _apply_timing_mask(self, actions: np.ndarray, current_ms: float) -> np.ndarray:
-        masked = actions.copy()
-        for i in range(5):
-            if actions[i, 0] > 0.5 and current_ms < actions[i, 1]:
-                masked[i, 0] = 0.0  # 아직 타이밍 안 됐으면 전개 억제
-        return masked
-
-    def close(self):
-        self.world.stop()

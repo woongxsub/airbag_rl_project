@@ -1,30 +1,34 @@
-from omni.isaac.core.objects import DynamicCuboid
+import os
 import numpy as np
+from isaacsim.core.utils.stage import add_reference_to_stage
+from isaacsim.core.prims import SingleRigidPrim
+import omni.usd
+
+VEHICLE_USD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../assets/vehicle.usd")
+VEHICLE_PRIM_PATH = "/World/vehicle"
 
 
 class Vehicle:
-    def __init__(self, world, position=(0.0, 0.0, 0.5)):
-        self.body = world.scene.add(
-            DynamicCuboid(
-                prim_path="/World/vehicle",
-                name="vehicle",
-                position=np.array(position),
-                size=np.array([2.0, 1.0, 0.8]),
-                mass=1500.0,
+    def __init__(self, world, position=(0.0, 0.0, 0.0)):
+        stage = omni.usd.get_context().get_stage()
+        if not stage.GetPrimAtPath(VEHICLE_PRIM_PATH).IsValid():
+            add_reference_to_stage(
+                usd_path=os.path.abspath(VEHICLE_USD),
+                prim_path=VEHICLE_PRIM_PATH,
             )
-        )
 
-    def apply_collision_force(self, angle_deg, speed_kmh, stiffness="concrete"):
-        stiffness_map = {"concrete": 1.0, "vehicle": 0.7, "wood": 0.4}
-        k = stiffness_map.get(stiffness, 1.0)
-        speed_ms = speed_kmh / 3.6
-        force_magnitude = 1500.0 * speed_ms * k * 10.0
-        angle_rad = np.deg2rad(angle_deg)
-        fx = -np.cos(angle_rad) * force_magnitude
-        fy = -np.sin(angle_rad) * force_magnitude
-        self.body.apply_force_torque(force=np.array([fx, fy, 0.0]))
+        if world.scene.object_exists("vehicle"):
+            self.body = world.scene.get_object("vehicle")
+        else:
+            self.body = world.scene.add(
+                SingleRigidPrim(
+                    prim_path=VEHICLE_PRIM_PATH,
+                    name="vehicle",
+                    position=np.array(position),
+                )
+            )
 
-    def reset(self, position=(0.0, 0.0, 0.5)):
+    def reset(self, position=(0.0, 0.0, 0.0)):
         self.body.set_world_pose(position=np.array(position))
         self.body.set_linear_velocity(np.array([0.0, 0.0, 0.0]))
         self.body.set_angular_velocity(np.array([0.0, 0.0, 0.0]))

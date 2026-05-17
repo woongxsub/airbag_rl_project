@@ -1,14 +1,16 @@
 env:
   headless: true
-  episode_steps: 60
-  sim_dt: 0.016667       # 1/60 초
+  state_dim: 12              # 시나리오(4) + 체형(2) + 자세(4) + 유격거리(2)
+  episode_steps: 60          # RL action 주기 횟수 (control_dt 기준)
+  physics_dt: 0.001          # 물리 연산 주기 1ms — HIC15 슬라이딩 윈도우 정밀도
+  control_dt: 0.016667       # RL action/observation 주기 1/60초
 
 ppo:
   lr: 3.0e-4
   gamma: 0.99
   clip: 0.2
   epochs: 10
-  batch_size: 256        # 에피소드 수 (업데이트 주기)
+  batch_size: 256
 
 train:
   total_episodes: 10000
@@ -23,5 +25,5 @@ scenario:
 airbag:
   timing_max_ms: 30.0
   pressure_max_kpa: 600.0
-  pressure_opt_kpa: 300.0   # 감쇠 최대 지점 (추후 논문 수치로 교체)
-  damping_max: 0.75          # 추후 논문 수치로 교체
+  pressure_opt_kpa: 300.0
+  damping_max: 0.75
