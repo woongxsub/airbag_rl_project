@@ -37,7 +37,7 @@ class AirbagEnv(gym.Env):
     Action : 15차원 (에어백 5개 × [deploy, timing, pressure])
     """
 
-    def __init__(self, headless: bool = True):
+    def __init__(self, headless: bool = True, debug: bool = False):
         super().__init__()
         self.world = World(
             physics_dt=PHYSICS_DT,
@@ -50,6 +50,7 @@ class AirbagEnv(gym.Env):
         self.collector = InjuryDataCollector(human=None, physics_dt=PHYSICS_DT)
         self._wall     = None
 
+        self.debug = debug
         self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(STATE_DIM,), dtype=np.float32)
         self.action_space      = spaces.Box(low=0.0, high=1.0, shape=(15,), dtype=np.float32)
 
@@ -128,6 +129,15 @@ class AirbagEnv(gym.Env):
 
         self.world.step(render=False)
         self._step += 1
+
+        if self.debug:
+            print(
+                f"[step {self._step:02d}] "
+                f"head={len(self.collector.head_acc_g):4d}샘플  "
+                f"torso={len(self.collector.torso_acc_g):4d}샘플  "
+                f"thigh={len(self.collector.thigh_acc_3d):4d}샘플",
+                flush=True,
+            )
 
         done   = self._step >= COLLISION_STEPS
         reward = 0.0

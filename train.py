@@ -11,11 +11,25 @@ from isaacsim import SimulationApp
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--headless", action="store_true")
+parser.add_argument("--stream",   action="store_true", help="WebRTC 스트리밍 활성화 (port 8211)")
+parser.add_argument("--debug",    action="store_true", help="스텝별 샘플 수 출력 (Dense reward 검증용)")
 parser.add_argument("--config", default="config/config.yaml")
 parser.add_argument("--mode", choices=["train", "baseline"], default="train")
 args = parser.parse_args()
 
-sim_app = SimulationApp({"headless": args.headless})
+sim_config = {"headless": True}
+if args.stream:
+    sim_config["renderer"] = "RayTracedLighting"
+    sim_config["width"]    = 1280
+    sim_config["height"]   = 720
+    sim_config["livestream"] = 1
+
+sim_app = SimulationApp(sim_config)
+
+if args.stream:
+    import carb
+    carb.settings.get_settings().set("/app/livestream/websocket/server_port", 8211)
+    print("[train] WebRTC streaming 활성화 — port 8211")
 
 # SimulationApp 이후에 import
 from env.airbag_env import AirbagEnv
@@ -30,7 +44,7 @@ os.makedirs("results/logs", exist_ok=True)
 
 
 def run_baseline(episodes=200):
-    env = AirbagEnv(headless=args.headless)
+    env = AirbagEnv(headless=True, debug=args.debug)
     rewards = []
     for ep in range(episodes):
         obs, _ = env.reset()
@@ -56,7 +70,7 @@ def run_baseline(episodes=200):
 
 
 def run_train():
-    env = AirbagEnv(headless=args.headless)
+    env = AirbagEnv(headless=True, debug=args.debug)
     agent = PPOAgent(
         state_dim=12,
         lr=cfg["ppo"]["lr"],
