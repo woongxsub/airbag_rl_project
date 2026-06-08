@@ -289,6 +289,24 @@ class Human:
             return np.asarray(vels[0, self._thigh_idx, :3])
         return np.zeros(3)
 
+    # ── 충돌 비활성화 ─────────────────────────────────────────────────────
+
+    def disable_collision(self):
+        """인체 링크 물리 충돌을 비활성화. 사용 이유: 차량 내부 박스와 겹치면
+        PhysX가 겹침 해소 충격력을 인가해 HIC가 수만 수준으로 폭발한다.
+        에어백·안전벨트는 직접 힘 인가(apply_forces)로 처리하므로 콜라이더 불필요."""
+        from pxr import Usd, UsdPhysics
+        stage = omni.usd.get_context().get_stage()
+        human_prim = stage.GetPrimAtPath(HUMAN_PRIM_PATH)
+        if not human_prim.IsValid():
+            return
+        count = 0
+        for prim in Usd.PrimRange(human_prim):
+            if prim.HasAPI(UsdPhysics.CollisionAPI):
+                UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Set(False)
+                count += 1
+        print(f"[Human] collision disabled on {count} prims")
+
     # ── 리셋 ─────────────────────────────────────────────────────────────
 
     def reset(self):

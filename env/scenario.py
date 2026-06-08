@@ -1,31 +1,28 @@
 """
 시나리오 샘플러 및 State 벡터 인코더.
 
-State 12차원 설계:
-  [0]  충돌 방향   angle / 360
-  [1]  충돌 속도   speed / 120
-  [2]  충돌 강성   concrete=1.0 / vehicle=0.7 / wood=0.4
-  [3]  안전벨트    0 or 1
-  [4]  신장        height / 2.0
-  [5]  앉은키(실측) sitting_height / 1.2  (착좌 후 head_z - seat_z)
-  [6]  머리 X      head_pos[0] / 1.5     (차량 로컬 전후)
-  [7]  머리 Y      (head_pos[1] + 1.0) / 2.0  (차량 로컬 좌우)
-  [8]  머리 Z      head_pos[2] / 2.0     (차량 로컬 높이)
-  [9]  척추 기울기  (spine_tilt_deg + 15) / 35  (-15°~+20° → 0~1)
-  [10] 머리-스티어링 거리  head_to_steering / 1.0
-  [11] 무릎-대시보드 거리  knee_to_dashboard / 0.5
+State 11차원 설계 (실차 센서로 측정 가능한 값만):
+  [0]  충돌 방향   angle / 360          (외부 레이더/카메라)
+  [1]  충돌 속도   speed / 120          (차속 센서)
+  [2]  안전벨트    0 or 1               (벨트 버클 센서)
+  [3]  신장        height / 2.0         (cabin ToF 카메라)
+  [4]  앉은키(실측) sitting_height / 1.2 (cabin ToF 카메라)
+  [5]  머리 X      head_pos[0] / 1.5    (cabin ToF 카메라)
+  [6]  머리 Y      (head_pos[1] + 1.0) / 2.0  (cabin ToF 카메라)
+  [7]  머리 Z      head_pos[2] / 2.0    (cabin ToF 카메라)
+  [8]  척추 기울기  (spine_tilt_deg + 15) / 35  (cabin ToF 카메라)
+  [9]  머리-스티어링 거리  head_to_steering / 1.0  (cabin ToF 카메라)
+  [10] 무릎-대시보드 거리  knee_to_dashboard / 0.5 (cabin ToF 카메라)
 
-[5]~[11] 은 에피소드 리셋 시 airbag_env 가 measure_snapshot() 으로 측정하여
+[4]~[10] 은 에피소드 리셋 시 airbag_env 가 measure_snapshot() 으로 측정하여
 scenario dict 에 추가한다. 값이 없으면 신장 기반 추정치로 대체.
+충돌 강성(stiffness)은 실차에서 사전 측정 불가 → 제외.
 """
 
 import numpy as np
 
-STIFFNESS_OPTIONS = ["concrete", "vehicle", "wood"]
-_STIFFNESS_ENC = {"concrete": 1.0, "vehicle": 0.7, "wood": 0.4}
-
 # State 차원 (ppo.py / train.py 와 동기화)
-STATE_DIM = 12
+STATE_DIM = 11
 
 # 착좌 자세 척추 기울기 샘플 범위 (도)
 SPINE_TILT_MIN_DEG = -10.0
@@ -41,7 +38,6 @@ class ScenarioSampler:
         return {
             "angle":    float(self.rng.uniform(0, 360)),
             "speed":    float(self.rng.uniform(20, 120)),
-            "stiffness": str(self.rng.choice(STIFFNESS_OPTIONS)),
             "seatbelt": bool(self.rng.integers(0, 2)),
             "height":   float(self.rng.uniform(1.55, 1.90)),
             "weight":   float(self.rng.uniform(50.0, 100.0)),
@@ -67,7 +63,6 @@ class ScenarioSampler:
         return np.array([
             scenario["angle"] / 360.0,
             scenario["speed"] / 120.0,
-            _STIFFNESS_ENC[scenario["stiffness"]],
             float(scenario["seatbelt"]),
             np.clip(height / 2.0, 0.0, 1.0),
             np.clip(sitting_height / 1.2, 0.0, 1.0),

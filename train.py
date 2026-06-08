@@ -7,27 +7,42 @@ import numpy as np
 # ── Isaac Sim 부트스트랩 ─────────────────────────────────────────────────
 os.environ["OMNI_KIT_ACCEPT_EULA"] = "yes"
 sys.path.insert(0, "/workspace/isaacsim_env/lib/python3.12/site-packages")
-from isaacsim import SimulationApp
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--headless", action="store_true")
 parser.add_argument("--stream",   action="store_true", help="WebRTC 스트리밍 활성화 (port 8211)")
+parser.add_argument("--gui",      action="store_true", help="noVNC용 GUI 창 표시 (DISPLAY 환경변수 필요)")
 parser.add_argument("--debug",    action="store_true", help="스텝별 샘플 수 출력 (Dense reward 검증용)")
 parser.add_argument("--config", default="config/config.yaml")
 parser.add_argument("--mode", choices=["train", "baseline"], default="train")
 args = parser.parse_args()
 
+# lavapipe Vulkan (GUI/stream 모드에서 GPU 없을 때)
+if args.stream or args.gui:
+    os.environ.setdefault(
+        "VK_ICD_FILENAMES",
+        "/usr/share/vulkan/icd.d/lvp_icd.json",
+    )
+
+from isaacsim import SimulationApp
+
 sim_config = {"headless": True}
 if args.stream:
-    sim_config["renderer"] = "RayTracedLighting"
-    sim_config["width"]    = 1280
-    sim_config["height"]   = 720
-    sim_config["livestream"] = 1
+    sim_config["headless"]    = False
+    sim_config["width"]       = 1280
+    sim_config["height"]      = 720
+    sim_config["livestream"]  = 1
+elif args.gui:
+    # noVNC 모드: GUI 창만 띄움 (WebRTC 없음, X11 디스플레이에 렌더링)
+    sim_config["headless"]    = False
+    sim_config["width"]       = 1280
+    sim_config["height"]      = 720
 
 sim_app = SimulationApp(sim_config)
 
+import carb
+carb.settings.get_settings().set("/physics/cudaDevice", 0)
 if args.stream:
-    import carb
     carb.settings.get_settings().set("/app/livestream/websocket/server_port", 8211)
     print("[train] WebRTC streaming 활성화 — port 8211")
 
@@ -72,11 +87,13 @@ def run_baseline(episodes=200):
 def run_train():
     env = AirbagEnv(headless=True, debug=args.debug)
     agent = PPOAgent(
-        state_dim=12,
+        state_dim=cfg["env"]["state_dim"],
         lr=cfg["ppo"]["lr"],
         gamma=cfg["ppo"]["gamma"],
         clip=cfg["ppo"]["clip"],
         epochs=cfg["ppo"]["epochs"],
+        lam=cfg["ppo"].get("lam", 0.95),
+        entropy_coeff=cfg["ppo"].get("entropy_coeff", 0.01),
     )
 
     total_episodes = cfg["train"]["total_episodes"]
@@ -98,10 +115,12 @@ def run_train():
             action, log_prob = agent.select_action(obs)
             next_obs, reward, done, _, _ = env.step(action)
             buffer.append({
-                "state": obs,
-                "action": action,
-                "log_prob": log_prob,
-                "reward": reward,
+                "state":      obs,
+                "action":     action,
+                "log_prob":   log_prob,
+                "reward":     reward,
+                "next_state": next_obs,
+                "done":       done,
             })
             ep_reward += reward
             log_prob_sum += log_prob

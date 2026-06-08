@@ -43,11 +43,22 @@ args = parser.parse_args()
 from isaacsim import SimulationApp
 
 if args.stream:
-    STREAMING_KIT = (
-        "/workspace/isaacsim_env/lib/python3.12/site-packages/"
-        "isaacsim/apps/isaacsim.exp.full.streaming.kit"
-    )
-    sim_app = SimulationApp({"headless": False}, experience=STREAMING_KIT)
+    # streaming kit 의존성 불완전 환경 우회:
+    # 기본 headless app으로 시작 후 livestream 익스텐션을 동적으로 활성화
+    sim_app = SimulationApp({"headless": True})
+    import omni.kit.app
+    _ext_mgr = omni.kit.app.get_app().get_extension_manager()
+    for _ext in [
+        "omni.kit.livestream.webrtc",
+        "omni.kit.livestream.core",
+        "omni.kit.livestream.messaging",
+        "omni.kit.livestream.app",
+    ]:
+        try:
+            _ext_mgr.set_extension_enabled_immediate(_ext, True)
+            print(f"  [Streaming] {_ext} 활성화")
+        except Exception as _e:
+            print(f"  [Streaming] {_ext} 실패: {_e}")
     print("\n" + "="*60)
     print("WebRTC 스트리밍 시작됨")
     print("  신호 포트: TCP 49100  (RunPod Custom Port 로 노출)")

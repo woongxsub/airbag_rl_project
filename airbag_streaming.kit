@@ -1,0 +1,41 @@
+[package]
+description = "Airbag RL — WebRTC Streaming (base, no robot_setup)"
+title = "Airbag RL Streaming"
+version = "1.0.0"
+
+[dependencies]
+"isaacsim.exp.base" = {}
+"omni.kit.livestream.app" = {}
+
+[settings]
+app.name = "Airbag-RL Streaming"
+app.version = "1.0.0"
+app.vulkan = true
+app.enableDeveloperWarnings = false
+
+[settings.app.exts.folders]
+'++' = [
+    "${app}",
+    "${app}/../exts",
+    "${app}/../extscache",
+    "${app}/../extsUser",
+    "${app}/../extsDeprecated",
+]
+
+[settings.app.window]
+hideUi = false
+title = "Airbag RL Streaming"
+drawMouse = false
+
+[settings.exts."omni.kit.livestream.app"]
+primaryStream.signalPort = 49100
+primaryStream.streamPort = 47998
+primaryStream.allowDynamicResize = true
+primaryStream.enableEventTracing = false
+primaryStream.enableOpenTelemetry = false
+primaryStream.streamType = "webrtc"
+
+[settings.exts."omni.services.livestream.session"]
+quitOnSessionEnded = true
+resumeTimeoutSeconds = 30
+waitForSessionReadyEvent = false

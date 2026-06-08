@@ -1,5 +1,10 @@
 """
 에어백 RL 환경 — Isaac Sim 6.0 / Python 3.12.
+
+물리 충돌 모델: rigid wall + compliant contact material
+  차량 전면에 crumple zone 등가 재질 적용
+  stiffness=2e5 N/m, damping=1e5 N·s/m
+  → 1ms 스텝 내 충격력 유한화, NaN 폭발 방지
 """
 
 import numpy as np
@@ -7,7 +12,8 @@ import gymnasium as gym
 from gymnasium import spaces
 
 from isaacsim.core.api import World
-from isaacsim.core.api.objects import FixedCuboid
+from isaacsim.core.api.objects import FixedCuboid, GroundPlane
+from pxr import UsdPhysics, PhysxSchema, UsdShade, Sdf
 from isaacsim.core.utils.rotations import euler_angles_to_quat
 
 from env.vehicle import Vehicle
@@ -18,23 +24,29 @@ from rl.reward import (
     InjuryDataCollector,
     compute_hic15, compute_chest_g, compute_chest_3ms_clip,
     compute_chest_compression_mm, compute_femur_force_n, compute_nij,
-    compute_reward,
+    compute_reward, compute_step_reward,
 )
 
-PHYSICS_DT      = 0.001
-CONTROL_DT      = 1.0 / 60.0
-COLLISION_STEPS = 60
-TIMING_MAX_MS   = 30.0
+PHYSICS_DT       = 0.001
+CONTROL_DT       = 1.0 / 60.0
+COLLISION_STEPS  = 60
+PHYSICS_SUBSTEPS = max(1, round(CONTROL_DT / PHYSICS_DT))  # 17
+TIMING_MAX_MS    = 30.0
 
 WALL_DIST_M = 3.5
 WALL_SIZE   = np.array([0.5, 5.0, 3.0])
 WALL_POS_Z  = 1.5
 
+# compliant contact (crumple zone 등가 재질)
+_CONTACT_STIFFNESS = 2e5   # N/m  — 차량 크럼플존 등가 스프링 강성
+_CONTACT_DAMPING   = 1e5   # N·s/m — 임계감쇠 근처 (바운싱 억제)
+
 
 class AirbagEnv(gym.Env):
     """
-    State  : 12차원
+    State  : 11차원 (실차 센서 측정 가능한 값만)
     Action : 15차원 (에어백 5개 × [deploy, timing, pressure])
+    Reward : Dense (스텝마다) + Terminal (에피소드 종료 시 bonus/penalty)
     """
 
     def __init__(self, headless: bool = True, debug: bool = False):
@@ -44,11 +56,17 @@ class AirbagEnv(gym.Env):
             rendering_dt=CONTROL_DT,
             stage_units_in_meters=1.0,
         )
-        self.sampler   = ScenarioSampler()
-        self._rng      = np.random.default_rng()
-        self.scenario  = None
-        self.collector = InjuryDataCollector(human=None, physics_dt=PHYSICS_DT)
-        self._wall     = None
+        self.world.get_physics_context().enable_gpu_dynamics(True)
+        self.sampler          = ScenarioSampler()
+        self._rng             = np.random.default_rng()
+        self.scenario         = None
+        self.collector        = InjuryDataCollector(human=None, physics_dt=PHYSICS_DT)
+        self._wall            = None
+        self.last_raw_actions = None
+
+        self._cb_actions  = np.zeros((5, 3), dtype=np.float32)
+        self._cb_seatbelt = False
+        self._physics_ms  = 0.0
 
         self.debug = debug
         self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(STATE_DIM,), dtype=np.float32)
@@ -65,6 +83,7 @@ class AirbagEnv(gym.Env):
 
         self.vehicle = Vehicle(self.world, position=(0.0, 0.0, 0.0))
         self._place_wall(angle_deg)
+        self._apply_vehicle_compliant_contact()
 
         human_world_pos = np.zeros(3) + SEAT_LOCAL
         self.human = Human(
@@ -75,19 +94,22 @@ class AirbagEnv(gym.Env):
         )
         self.airbag_sys = AirbagSystem(self.world, self.human)
 
+        if not self.world.scene.object_exists("ground_plane"):
+            self.world.scene.add(GroundPlane(prim_path="/World/GroundPlane",
+                                             name="ground_plane",
+                                             z_position=0.0))
+
         self.world.reset()
 
         self.human.initialize()
+        self._filter_vehicle_human_collision()
         self.airbag_sys.reset()
 
-        # 착좌 자세 인가
         spine_tilt_deg = float(self._rng.uniform(SPINE_TILT_MIN_DEG, SPINE_TILT_MAX_DEG))
         self.human.set_sitting_posture(spine_tilt_deg=spine_tilt_deg)
 
-        # 관절 위치 PhysX 전파
         self.world.step(render=False)
 
-        # Pre-crash snapshot
         snapshot = self.human.measure_snapshot(vehicle_body=self.vehicle.body)
         self.scenario.update({
             "sitting_height":    snapshot["sitting_height"],
@@ -97,7 +119,6 @@ class AirbagEnv(gym.Env):
             "knee_to_dashboard": snapshot["knee_to_dashboard"],
         })
 
-        # 초기 속도 부여
         speed_ms  = speed_kmh / 3.6
         angle_rad = np.deg2rad(angle_deg)
         init_vel  = np.array([speed_ms * np.cos(angle_rad),
@@ -105,7 +126,6 @@ class AirbagEnv(gym.Env):
         self.vehicle.body.set_linear_velocity(init_vel)
         self.human.set_initial_velocity(init_vel)
 
-        # 센서 콜백 등록
         self.collector.human = self.human
         self.collector.reset()
         try:
@@ -114,7 +134,19 @@ class AirbagEnv(gym.Env):
             pass
         self.world.add_physics_callback("collect_injury", self.collector.physics_callback)
 
-        self._step = 0
+        self._cb_actions  = np.zeros((5, 3), dtype=np.float32)
+        self._cb_seatbelt = bool(self.scenario["seatbelt"])
+        self._physics_ms  = 0.0
+
+        try:
+            self.world.remove_physics_callback("apply_forces")
+        except Exception:
+            pass
+        self.world.add_physics_callback("apply_forces", self._force_physics_callback)
+
+        self._step              = 0
+        self._prev_sample_count = 0
+
         obs = self.sampler.to_state_vector(self.scenario)
         return obs, {}
 
@@ -122,25 +154,48 @@ class AirbagEnv(gym.Env):
 
     def step(self, action: np.ndarray):
         raw_actions = self._parse_action(action)
+        self.last_raw_actions = raw_actions.copy()
 
-        self.human.apply_seatbelt(self.scenario["seatbelt"], self.vehicle.body)
+        self._cb_actions  = raw_actions.copy()
+        self._cb_seatbelt = bool(self.scenario["seatbelt"])
+
         current_ms = self._step * CONTROL_DT * 1000.0
         self.airbag_sys.apply(raw_actions, self.scenario["angle"], current_ms)
 
-        self.world.step(render=False)
+        prev_count = self._prev_sample_count
+
+        for _ in range(PHYSICS_SUBSTEPS):
+            self.world.step(render=False)
         self._step += 1
+
+        curr_count = len(self.collector.head_acc_g)
+        self._prev_sample_count = curr_count
 
         if self.debug:
             print(
                 f"[step {self._step:02d}] "
-                f"head={len(self.collector.head_acc_g):4d}샘플  "
+                f"head={curr_count:4d}샘플  "
                 f"torso={len(self.collector.torso_acc_g):4d}샘플  "
                 f"thigh={len(self.collector.thigh_acc_3d):4d}샘플",
                 flush=True,
             )
 
-        done   = self._step >= COLLISION_STEPS
-        reward = 0.0
+        deploy_flags = [raw_actions[i, 0] > 0.5 for i in range(5)]
+
+        # Dense reward: 이번 스텝 윈도우 (~17ms)
+        reward = compute_step_reward(
+            head_acc_g   = self.collector.head_acc_g[prev_count:curr_count],
+            head_acc_3d  = self.collector.head_acc_3d[prev_count:curr_count],
+            torso_acc_g  = self.collector.torso_acc_g[prev_count:curr_count],
+            thigh_acc_3d = self.collector.thigh_acc_3d[prev_count:curr_count],
+            torso_pos    = self.collector.torso_pos_history[prev_count:curr_count],
+            dt           = PHYSICS_DT,
+            deploy_flags = deploy_flags,
+            n_steps      = COLLISION_STEPS,
+        )
+
+        done = self._step >= COLLISION_STEPS
+        info = {}
 
         if done:
             dt          = PHYSICS_DT
@@ -150,25 +205,114 @@ class AirbagEnv(gym.Env):
             compression = compute_chest_compression_mm(self.collector.torso_pos_history)
             femur_n     = compute_femur_force_n(self.collector.thigh_acc_3d)
             nij         = compute_nij(self.collector.head_acc_3d)
-            deploy_flags = [raw_actions[i, 0] > 0.5 for i in range(5)]
 
-            reward = compute_reward(
+            terminal_reward = compute_reward(
                 hic15=hic15, chest_g=chest_g, chest_3ms=chest_3ms,
                 chest_compression_mm=compression, femur_n=femur_n,
                 nij=nij, deploy_flags=deploy_flags,
             )
+            reward += terminal_reward
+            info = {
+                "hic15":                hic15,
+                "chest_g":              chest_g,
+                "chest_3ms":            chest_3ms,
+                "chest_compression_mm": compression,
+                "femur_n":              femur_n,
+                "nij":                  nij,
+                "deploy_count":         int(sum(deploy_flags)),
+            }
 
         obs = self.sampler.to_state_vector(self.scenario)
-        return obs, reward, done, False, {}
+        return obs, reward, done, False, info
 
     # ── 종료 ───────────────────────────────────────────────────────────
 
     def close(self):
-        try:
-            self.world.remove_physics_callback("collect_injury")
-        except Exception:
-            pass
+        for cb in ("collect_injury", "apply_forces"):
+            try:
+                self.world.remove_physics_callback(cb)
+            except Exception:
+                pass
         self.world.stop()
+
+    # ── compliant contact 적용 ─────────────────────────────────────────
+
+    def _apply_vehicle_compliant_contact(self):
+        """
+        차량 물리 재질에 compliant contact 속성 부여.
+        stiffness: 차량 크럼플존 등가 스프링 강성 (N/m)
+        damping  : 에너지 흡수 댐퍼 계수 (N·s/m)
+        → rigid wall 충돌 시 힘이 시간에 분산되어 NaN 방지.
+        """
+        import omni.usd
+        stage = omni.usd.get_context().get_stage()
+
+        mat_path = "/World/VehicleContactMat"
+        if not stage.GetPrimAtPath(mat_path).IsValid():
+            mat_prim = stage.DefinePrim(mat_path, "Material")
+
+            phys_mat = UsdPhysics.MaterialAPI.Apply(mat_prim)
+            phys_mat.CreateRestitutionAttr(0.0)
+            phys_mat.CreateStaticFrictionAttr(0.3)
+            phys_mat.CreateDynamicFrictionAttr(0.3)
+
+            physx_mat = PhysxSchema.PhysxMaterialAPI.Apply(mat_prim)
+            physx_mat.CreateCompliantContactStiffnessAttr(_CONTACT_STIFFNESS)
+            physx_mat.CreateCompliantContactDampingAttr(_CONTACT_DAMPING)
+        else:
+            mat_prim = stage.GetPrimAtPath(mat_path)
+
+        # 차량 전체 collision prim에 바인딩
+        from pxr import Usd
+        vehicle_prim = stage.GetPrimAtPath("/World/vehicle")
+        if not vehicle_prim.IsValid():
+            return
+        count = 0
+        for prim in Usd.PrimRange(vehicle_prim):
+            if prim.HasAPI(UsdPhysics.CollisionAPI):
+                binding = UsdShade.MaterialBindingAPI.Apply(prim)
+                binding.Bind(
+                    UsdShade.Material(mat_prim),
+                    UsdShade.Tokens.weakerThanDescendants,
+                    "physics",
+                )
+                count += 1
+        if count:
+            print(f"[Env] compliant contact material applied ({count} collision prims)")
+
+    def _filter_vehicle_human_collision(self):
+        """차량 콜라이더와 인체 prim 간 충돌 필터 비활성화."""
+        import omni.usd
+        from pxr import Usd
+        stage = omni.usd.get_context().get_stage()
+        human_path = Sdf.Path("/World/human")
+        vehicle_prim = stage.GetPrimAtPath("/World/vehicle")
+        if not vehicle_prim.IsValid():
+            return
+        count = 0
+        for prim in Usd.PrimRange(vehicle_prim):
+            if prim.HasAPI(UsdPhysics.CollisionAPI):
+                api = UsdPhysics.FilteredPairsAPI.Apply(prim)
+                rel = api.GetFilteredPairsRel()
+                targets = rel.GetTargets()
+                if human_path not in targets:
+                    rel.AddTarget(human_path)
+                    count += 1
+        if count:
+            print(f"[Env] vehicle-human collision filter applied ({count} prims)")
+
+    def _force_physics_callback(self, step_size: float):
+        """1ms 물리 스텝마다 호출: 안전벨트 + 에어백 감쇠력 인가."""
+        self._physics_ms += step_size * 1000.0
+        if self.human is None:
+            return
+        self.human.apply_seatbelt(self._cb_seatbelt, self.vehicle.body)
+        if self.airbag_sys is not None and self.scenario is not None:
+            self.airbag_sys.apply_forces(
+                self._cb_actions,
+                self.scenario["angle"],
+                self._physics_ms,
+            )
 
     # ── 내부 ───────────────────────────────────────────────────────────
 

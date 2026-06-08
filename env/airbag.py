@@ -80,10 +80,10 @@ class AirbagSystem:
             self._sphere_prims[i] = UsdGeom.Sphere(stage.GetPrimAtPath(path))
 
     def apply(self, actions: np.ndarray, collision_angle: float, current_ms: float):
+        """Control step (60Hz): 팽창 타이밍 추적 + 반지름 visual 업데이트만."""
         for i, spec in AIRBAG_SPECS.items():
             deploy    = actions[i, 0] > 0.5
             timing_ms = actions[i, 1]
-            pressure  = actions[i, 2]
 
             if not deploy or current_ms < timing_ms or not _is_effective_angle(i, collision_angle):
                 if i not in self._fully_inflated:
@@ -95,8 +95,6 @@ class AirbagSystem:
                 self._inflate_start[i] = current_ms
 
             if i in self._fully_inflated:
-                damping = spec["k"] * _reverse_u_curve(pressure)
-                self._apply_damping(i, damping, spec)
                 continue
 
             elapsed       = current_ms - self._inflate_start[i]
@@ -106,9 +104,25 @@ class AirbagSystem:
             if inflate_ratio >= 1.0:
                 self._fully_inflated.add(i)
 
-            damping = spec["k"] * _reverse_u_curve(pressure)
-            if inflate_ratio >= 1.0:
-                self._apply_damping(i, damping, spec)
+    def apply_forces(self, actions: np.ndarray, collision_angle: float, current_ms: float):
+        """Physics callback (1000Hz): 감쇠력 인가만. USD 업데이트 없음."""
+        for i, spec in AIRBAG_SPECS.items():
+            deploy    = actions[i, 0] > 0.5
+            timing_ms = actions[i, 1]
+            pressure  = actions[i, 2]
+
+            if not deploy or current_ms < timing_ms or not _is_effective_angle(i, collision_angle):
+                continue
+            if i not in self._inflate_start:
+                continue
+
+            elapsed       = current_ms - self._inflate_start[i]
+            inflate_ratio = min(elapsed / INFLATE_MS, 1.0)
+            if inflate_ratio <= 0:
+                continue
+
+            damping = spec["k"] * _reverse_u_curve(pressure) * inflate_ratio
+            self._apply_damping(i, damping, spec)
 
     def reset(self):
         self._inflate_start.clear()

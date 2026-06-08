@@ -210,15 +210,16 @@ def compute_reward(
     deploy_flags:         list  = None,
 ) -> float:
     """
-    Dense reward 설계:
-      base      = -(각 지표 / 기준선)  합산 — 항상 연속 gradient
-      violation = -5 × 초과율          기준 초과 항목마다
-      bonus     = +2.0                 전 항목 기준 이하
-      no_deploy = -2.0                 에어백 미전개
-
-    예시 (기준선 60%, 전 항목 안전):
-      HIC=420, chest_g=36 → ≈ +1.3
+    에피소드 종료 시 전체 이력 기반 터미널 보상.
+    base      = -∑(val/safe)²       — 연속 gradient, 기준 근접 시 관대
+    violation = -5 × (초과율)²      — 기준 초과 시 가속적 패널티 (선형→이차)
+    bonus     = +2.0                 — 전 항목 기준 이하
+    no_deploy = -2.0                 — 에어백 미전개
     """
+    inputs = [hic15, chest_g, chest_3ms, chest_compression_mm, femur_n, nij]
+    if any(not np.isfinite(v) for v in inputs):
+        return -1000.0
+
     metrics = [
         (hic15,                HIC_SAFE),
         (chest_g,              CHEST_G_SAFE),
@@ -228,16 +229,68 @@ def compute_reward(
         (nij,                  NIJ_SAFE),
     ]
 
-    r = sum(-(val / safe) for val, safe in metrics)
+    r = sum(-(val / safe) ** 2 for val, safe in metrics)
 
     for val, safe in metrics:
         if val > safe:
-            r -= _VIOLATION_COEFF * (val / safe - 1.0)
+            excess = val / safe - 1.0
+            r -= _VIOLATION_COEFF * excess ** 2
 
     if all(val <= safe for val, safe in metrics):
         r += _SAFETY_BONUS
 
     if deploy_flags is not None and sum(deploy_flags) == 0:
         r -= _NO_DEPLOY_PEN
+
+    return float(r)
+
+
+def compute_step_reward(
+    head_acc_g:   list,
+    head_acc_3d:  list,
+    torso_acc_g:  list,
+    thigh_acc_3d: list,
+    torso_pos:    list,
+    dt:           float,
+    deploy_flags: list = None,
+    n_steps:      int  = 60,
+) -> float:
+    """
+    컨트롤 스텝 1개(~16ms 윈도우) 기반 중간 보상.
+    compute_reward()와 동일한 이차 패널티, 1/n_steps 스케일링.
+    전체 누적 시 터미널 보상과 유사한 크기 유지.
+    """
+    if not head_acc_g and not torso_acc_g:
+        return 0.0
+
+    hic15       = compute_hic15(head_acc_g, dt)
+    chest_g     = float(max(torso_acc_g)) if torso_acc_g else 0.0
+    chest_3ms   = compute_chest_3ms_clip(torso_acc_g, dt)
+    compression = compute_chest_compression_mm(torso_pos)
+    femur_n     = compute_femur_force_n(thigh_acc_3d)
+    nij         = compute_nij(head_acc_3d)
+
+    if any(not np.isfinite(v) for v in [hic15, chest_g, chest_3ms, compression, femur_n, nij]):
+        return 0.0
+
+    metrics = [
+        (hic15,       HIC_SAFE),
+        (chest_g,     CHEST_G_SAFE),
+        (chest_3ms,   CHEST_3MS_SAFE),
+        (compression, CHEST_COMPRESSION_SAFE),
+        (femur_n,     FEMUR_SAFE),
+        (nij,         NIJ_SAFE),
+    ]
+
+    scale = 1.0 / n_steps
+    r = sum(-(val / safe) ** 2 for val, safe in metrics) * scale
+
+    for val, safe in metrics:
+        if val > safe:
+            excess = val / safe - 1.0
+            r -= _VIOLATION_COEFF * excess ** 2 * scale
+
+    if deploy_flags is not None and sum(deploy_flags) == 0:
+        r -= _NO_DEPLOY_PEN * scale
 
     return float(r)
