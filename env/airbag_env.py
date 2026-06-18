@@ -38,8 +38,8 @@ WALL_SIZE   = np.array([0.5, 5.0, 3.0])
 WALL_POS_Z  = 1.5
 
 # compliant contact (crumple zone 등가 재질)
-_CONTACT_STIFFNESS = 2e5   # N/m  — 차량 크럼플존 등가 스프링 강성
-_CONTACT_DAMPING   = 1e5   # N·s/m — 임계감쇠 근처 (바운싱 억제)
+_CONTACT_STIFFNESS = 4.5e5  # N/m  — 차량 크럼플존 등가 스프링 강성 (2e5→4.5e5 조정)
+_CONTACT_DAMPING   = 1e5    # N·s/m — 임계감쇠 근처 (바운싱 억제)
 
 
 class AirbagEnv(gym.Env):
@@ -92,7 +92,7 @@ class AirbagEnv(gym.Env):
             height=self.scenario["height"],
             weight=self.scenario["weight"],
         )
-        self.airbag_sys = AirbagSystem(self.world, self.human)
+        self.airbag_sys = AirbagSystem(self.world, self.human, self.vehicle)
 
         if not self.world.scene.object_exists("ground_plane"):
             self.world.scene.add(GroundPlane(prim_path="/World/GroundPlane",
@@ -102,7 +102,7 @@ class AirbagEnv(gym.Env):
         self.world.reset()
 
         self.human.initialize()
-        self._filter_vehicle_human_collision()
+        self._filter_human_collisions()
         self.airbag_sys.reset()
 
         spine_tilt_deg = float(self._rng.uniform(SPINE_TILT_MIN_DEG, SPINE_TILT_MAX_DEG))
@@ -280,26 +280,48 @@ class AirbagEnv(gym.Env):
         if count:
             print(f"[Env] compliant contact material applied ({count} collision prims)")
 
-    def _filter_vehicle_human_collision(self):
-        """차량 콜라이더와 인체 prim 간 충돌 필터 비활성화."""
+    def _filter_human_collisions(self):
+        """
+        인체와 충돌해서는 안 되는 모든 prim에 FilteredPairs 필터 적용.
+
+        대상:
+          1. 차량 (/World/vehicle) — 인체가 차량 내부에서 시작하므로
+             겹침 해소 충격력 방지 (기존 동작 유지)
+          2. 벽 (/World/collision_wall) — 안전벨트·에어백이 수식 기반
+             힘으로만 구현되어 있어 rigid body 직접 충돌 시 비현실적
+             충격력 발생 → 필터로 차단
+
+        이 모델에서 모든 신체 운동은 안전벨트·에어백의 수식 힘으로만
+        결정된다. 수치는 절댓값이 아닌 Rule-Based 대비 상대적 개선으로
+        해석해야 한다.
+        """
         import omni.usd
         from pxr import Usd
         stage = omni.usd.get_context().get_stage()
         human_path = Sdf.Path("/World/human")
+
+        # ── 1. 차량 → human 필터 ──────────────────────────────────────
         vehicle_prim = stage.GetPrimAtPath("/World/vehicle")
-        if not vehicle_prim.IsValid():
-            return
-        count = 0
-        for prim in Usd.PrimRange(vehicle_prim):
-            if prim.HasAPI(UsdPhysics.CollisionAPI):
-                api = UsdPhysics.FilteredPairsAPI.Apply(prim)
-                rel = api.GetFilteredPairsRel()
-                targets = rel.GetTargets()
-                if human_path not in targets:
-                    rel.AddTarget(human_path)
-                    count += 1
-        if count:
-            print(f"[Env] vehicle-human collision filter applied ({count} prims)")
+        veh_count = 0
+        if vehicle_prim.IsValid():
+            for prim in Usd.PrimRange(vehicle_prim):
+                if prim.HasAPI(UsdPhysics.CollisionAPI):
+                    api = UsdPhysics.FilteredPairsAPI.Apply(prim)
+                    rel = api.GetFilteredPairsRel()
+                    if human_path not in rel.GetTargets():
+                        rel.AddTarget(human_path)
+                        veh_count += 1
+        if veh_count:
+            print(f"[Env] vehicle-human collision filter applied ({veh_count} prims)")
+
+        # ── 2. 벽 → human 필터 ────────────────────────────────────────
+        wall_prim = stage.GetPrimAtPath("/World/collision_wall")
+        if wall_prim.IsValid():
+            api = UsdPhysics.FilteredPairsAPI.Apply(wall_prim)
+            rel = api.GetFilteredPairsRel()
+            if human_path not in rel.GetTargets():
+                rel.AddTarget(human_path)
+                print("[Env] wall-human collision filter applied")
 
     def _force_physics_callback(self, step_size: float):
         """1ms 물리 스텝마다 호출: 안전벨트 + 에어백 감쇠력 인가."""
