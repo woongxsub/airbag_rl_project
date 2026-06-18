@@ -63,8 +63,10 @@ def run_baseline(episodes=200):
     rewards = []
     for ep in range(episodes):
         obs, _ = env.reset()
-        angle = env.scenario["angle"]
-        action_matrix = rule_based_policy(angle)
+        angle             = env.scenario["angle"]
+        is_rollover       = bool(env.scenario.get("is_rollover",       False))
+        passenger_present = bool(env.scenario.get("passenger_present", True))
+        action_matrix = rule_based_policy(angle, is_rollover, passenger_present)
         # airbag_env action 형식으로 변환 [deploy*5, timing*5, pressure*5]
         action = np.concatenate([
             action_matrix[:, 0],
