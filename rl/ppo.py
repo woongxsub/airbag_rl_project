@@ -111,7 +111,7 @@ class PPOAgent:
             action = torch.cat([deploy, t_mean * deploy, p_mean * deploy], dim=-1)
         return action.squeeze(0).numpy()
 
-    def update(self, transitions: list):
+    def update(self, transitions: list, debug: bool = False):
         transitions = [t for t in transitions if np.isfinite(t["reward"])]
         if not transitions:
             return {}
@@ -122,6 +122,27 @@ class PPOAgent:
         old_log_probs = torch.FloatTensor([t["log_prob"] for t in transitions])
         rewards     = torch.FloatTensor([t["reward"] for t in transitions])
         dones       = torch.FloatTensor([float(t["done"]) for t in transitions])
+
+        if debug:
+            print(f"[DEBUG-reward] RAW   : min={rewards.min().item():.3e}"
+                  f"  max={rewards.max().item():.3e}"
+                  f"  mean={rewards.mean().item():.3e}"
+                  f"  std={rewards.std().item():.3e}"
+                  f"  nan={torch.isnan(rewards).any().item()}"
+                  f"  n={len(transitions)}")
+
+        # ── 보상 정규화 (학습용 신호만 변환; raw reward/info 로깅값은 환경에서 불변) ──
+        # raw reward 스케일이 수십억에 달해 critic_loss 폭발 방지.
+        # 정규화 범위 epsilon은 advantage 정규화(1e-8)와 동일하게 맞춤.
+        r_mean = rewards.mean()
+        r_std  = rewards.std() + 1e-8
+        rewards = (rewards - r_mean) / r_std
+
+        if debug:
+            print(f"[DEBUG-reward] NORM  : min={rewards.min().item():.3e}"
+                  f"  max={rewards.max().item():.3e}"
+                  f"  mean={rewards.mean().item():.3e}"
+                  f"  std={rewards.std().item():.3e}")
 
         # GAE(λ) advantage 계산
         with torch.no_grad():
@@ -137,13 +158,21 @@ class PPOAgent:
 
         returns = advantages + values.detach()
 
+        if debug:
+            ret_nan = torch.isnan(returns).any().item()
+            ret_inf = torch.isinf(returns).any().item()
+            print(f"[DEBUG-update] returns: min={returns.min().item():.3e}"
+                  f"  max={returns.max().item():.3e}"
+                  f"  nan={ret_nan}  inf={ret_inf}")
+
         # 어드밴티지 정규화
         if advantages.std() > 1e-8:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         actor_loss_val = critic_loss_val = 0.0
+        params = list(self.actor.parameters()) + list(self.critic.parameters())
 
-        for _ in range(self.epochs):
+        for epoch_i in range(self.epochs):
             deploy_logit, t_mean, p_mean = self.actor(states)
             deploy   = actions[:, :5]
             timing   = actions[:, 5:10]
@@ -175,15 +204,47 @@ class PPOAgent:
             critic_loss = (returns - values_pred).pow(2).mean()
 
             loss = actor_loss + 0.5 * critic_loss
+
+            if debug and epoch_i == 0:
+                print(f"[DEBUG-update] epoch=0  actor_loss={actor_loss.item():.4f}"
+                      f"  critic_loss={critic_loss.item():.4e}"
+                      f"  loss={loss.item():.4e}"
+                      f"  loss_finite={torch.isfinite(loss).item()}")
+
             if not torch.isfinite(loss):
+                if debug:
+                    print(f"[DEBUG-update] epoch={epoch_i}  loss not finite → skip")
                 continue
+
             self.optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(self.actor.parameters()) + list(self.critic.parameters()),
-                max_norm=self.max_grad_norm,
-            )
+
+            # ── 클리핑 전 grad norm (계측만, 실제 클리핑 없음) ──────────────
+            norm_before = torch.nn.utils.clip_grad_norm_(params, max_norm=float('inf'))
+
+            if debug and epoch_i == 0:
+                print(f"[DEBUG-grad]  epoch=0 BEFORE clip:"
+                      f"  norm={norm_before.item():.4e}"
+                      f"  is_nan={torch.isnan(norm_before).item()}"
+                      f"  is_inf={torch.isinf(norm_before).item()}")
+
+            # ── 실제 클리핑 적용 ─────────────────────────────────────────────
+            norm_after = torch.nn.utils.clip_grad_norm_(params, max_norm=self.max_grad_norm)
+
+            if debug and epoch_i == 0:
+                print(f"[DEBUG-grad]  epoch=0 AFTER  clip (target={self.max_grad_norm}):"
+                      f"  norm={norm_after.item():.4e}"
+                      f"  is_nan={torch.isnan(norm_after).item()}"
+                      f"  is_inf={torch.isinf(norm_after).item()}")
+
             self.optimizer.step()
+
+            # ── 파라미터 NaN 오염 여부 ───────────────────────────────────────
+            if debug and epoch_i == 0:
+                actor_nan  = any(torch.isnan(p).any().item() for p in self.actor.parameters())
+                critic_nan = any(torch.isnan(p).any().item() for p in self.critic.parameters())
+                print(f"[DEBUG-param] epoch=0 AFTER step:"
+                      f"  actor_nan={actor_nan}  critic_nan={critic_nan}")
 
             actor_loss_val  = actor_loss.item()
             critic_loss_val = critic_loss.item()
