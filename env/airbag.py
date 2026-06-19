@@ -198,6 +198,10 @@ class AirbagSystem:
             else:
                 continue
 
+            # NaN 가드: 초기화 직후 physics_view 값이 유효하지 않을 때
+            if not np.all(np.isfinite(vel)):
+                continue
+
             # ── 거리 기반 게이트 ─────────────────────────────────────────
             # 신체 부위(world)와 에어백 중심(world) 간 거리가
             # 현재 에어백 반경(max_radius * inflate_ratio) 초과 시 스킵.

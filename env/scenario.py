@@ -1,7 +1,7 @@
 """
 시나리오 샘플러 및 State 벡터 인코더.
 
-State 13차원 설계 (실차 센서로 측정 가능한 값만):
+State 11차원 설계 (실차 센서로 측정 가능한 값만):
   [0]  충돌 방향   angle / 360          (외부 레이더/카메라)
   [1]  충돌 속도   speed / 120          (차속 센서)
   [2]  안전벨트    0 or 1               (벨트 버클 센서)
@@ -13,18 +13,18 @@ State 13차원 설계 (실차 센서로 측정 가능한 값만):
   [8]  척추 기울기  (spine_tilt_deg + 15) / 35  (cabin ToF 카메라)
   [9]  머리-스티어링 거리  head_to_steering / 1.0  (cabin ToF 카메라)
   [10] 무릎-대시보드 거리  knee_to_dashboard / 0.5 (cabin ToF 카메라)
-  [11] 전복 여부   is_rollover   0 or 1  (rollover sensor — 자이로/각속도)
-  [12] 동승자 점유  passenger_present 0 or 1  (OCS 시트 센서)
 
 [4]~[10] 은 에피소드 리셋 시 airbag_env 가 measure_snapshot() 으로 측정하여
 scenario dict 에 추가한다. 값이 없으면 신장 기반 추정치로 대체.
 충돌 강성(stiffness)은 실차에서 사전 측정 불가 → 제외.
+is_rollover / passenger_present 는 sample() 내부에서 유지되지만
+State에는 포함하지 않음 — rule_based_policy() 인자로만 사용.
 """
 
 import numpy as np
 
 # State 차원 (ppo.py / train.py 와 동기화)
-STATE_DIM = 13
+STATE_DIM = 11
 
 # 착좌 자세 척추 기울기 샘플 범위 (도)
 SPINE_TILT_MIN_DEG = -10.0
@@ -51,8 +51,8 @@ class ScenarioSampler:
 
     def to_state_vector(self, scenario: dict) -> np.ndarray:
         """
-        scenario dict → 12차원 정규화 벡터 [0, 1].
-        measure_snapshot 결과([5]~[11])가 없으면 신장 기반 추정치 사용.
+        scenario dict → 11차원 정규화 벡터 [0, 1].
+        measure_snapshot 결과([4]~[10])가 없으면 신장 기반 추정치 사용.
         """
         height = scenario["height"]
 
@@ -78,6 +78,4 @@ class ScenarioSampler:
             np.clip((spine_tilt_deg + 15.0) / 35.0, 0.0, 1.0),
             np.clip(head_to_steering  / 1.0, 0.0, 1.0),
             np.clip(knee_to_dashboard / 0.5, 0.0, 1.0),
-            float(scenario.get("is_rollover",       False)),  # [11] rollover sensor
-            float(scenario.get("passenger_present", True)),   # [12] OCS 시트 센서
         ], dtype=np.float32)

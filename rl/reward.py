@@ -17,7 +17,7 @@ HIC_SAFE               = 700.0
 CHEST_G_SAFE           = 60.0    # 흉부 최대 합성가속도 (g)
 CHEST_3MS_SAFE         = 60.0    # 흉부 3ms 클립 (g)
 CHEST_COMPRESSION_SAFE = 50.0    # 흉부 압축량 (mm)
-FEMUR_SAFE             = 10_000.0 # 대퇴부 압축력 (N)
+FEMUR_SAFE             = 10_000.0 # 대퇴부 압축력 (N) — 현재 무릎 에어백 미구현으로 보상함수에서 제외함
 NIJ_SAFE               = 1.0     # 목 상해 지수 Nij
 
 # ── Hybrid III 참조값 (NHTSA 표준) ──────────────────────────────────────
@@ -28,7 +28,7 @@ NIJ_FZC_COMPRESS  = 6160.0  # N  (목 압축)
 NIJ_MYC_EXTENSION = 310.0   # N·m (신전 모멘트)
 NIJ_MYC_FLEXION   = 135.0   # N·m (굴곡 모멘트)
 
-THIGH_MASS_KG = 8.55  # Hybrid III 우측 대퇴부 질량
+THIGH_MASS_KG = 8.55  # Hybrid III 우측 대퇴부 질량 — 현재 무릎 에어백 미구현으로 보상함수에서 제외함
 
 # ── 보상 스케일 ──────────────────────────────────────────────────────────
 _VIOLATION_COEFF = 5.0
@@ -50,19 +50,45 @@ class InjuryDataCollector:
         world.add_physics_callback("collect_injury", collector.physics_callback)
     """
 
-    def __init__(self, human=None, physics_dt: float = 0.001):
-        self.human = human
-        self.physics_dt = physics_dt
+    def __init__(self, human=None, vehicle_body=None, physics_dt: float = 0.001):
+        self.human        = human
+        self.vehicle_body = vehicle_body  # 차량 기준 상대 torso 위치 계산용
+        self.physics_dt   = physics_dt
         self.reset()
 
     def physics_callback(self, step_size: float):
         if self.human is None or self.human.articulation is None:
             return
+
+        head_vel  = self.human.get_head_velocity()
+        torso_vel = self.human.get_torso_velocity()
+        torso_pos = self.human.get_torso_position()
         thigh_vel = self.human.get_thigh_velocity_3d()
+
+        # NaN/Inf 가드: 초기화 직후 또는 물리 폭발 시 skip
+        if not (np.all(np.isfinite(head_vel)) and np.all(np.isfinite(torso_vel))):
+            return
+        # 속도 크기 가드: 물리 솔버 폭발(대형 유한 수) 방지
+        _MAX_VEL = 200.0  # 720 km/h 이상이면 물리 발산 상태
+        if np.linalg.norm(head_vel) > _MAX_VEL or np.linalg.norm(torso_vel) > _MAX_VEL:
+            return
+
+        # chest_compression: 차량 기준 상대 torso 위치 저장
+        # get_world_pose()는 physics callback에서 실패할 수 있으므로
+        # get_linear_velocity()로 차량 위치를 적분 (apply_seatbelt에서도 동일하게 성공)
+        if self.vehicle_body is not None:
+            try:
+                veh_vel = np.asarray(self.vehicle_body.get_linear_velocity(), dtype=np.float32)
+                if np.all(np.isfinite(veh_vel)):
+                    self._vehicle_int_pos += veh_vel * step_size
+            except Exception:
+                pass
+        torso_pos = torso_pos - self._vehicle_int_pos
+
         self.record(
-            head_vel  = self.human.get_head_velocity(),
-            torso_vel = self.human.get_torso_velocity(),
-            torso_pos = self.human.get_torso_position(),
+            head_vel  = head_vel,
+            torso_vel = torso_vel,
+            torso_pos = torso_pos,
             dt        = step_size,
             thigh_vel = thigh_vel,
         )
@@ -93,14 +119,15 @@ class InjuryDataCollector:
         self._prev_thigh_vel = thigh_vel.copy() if thigh_vel is not None else None
 
     def reset(self):
-        self.head_acc_3d:      list = []
-        self.head_acc_g:       list = []
-        self.torso_acc_g:      list = []
+        self.head_acc_3d:       list = []
+        self.head_acc_g:        list = []
+        self.torso_acc_g:       list = []
         self.torso_pos_history: list = []
-        self.thigh_acc_3d:     list = []
-        self._prev_head_vel   = None
-        self._prev_torso_vel  = None
-        self._prev_thigh_vel  = None
+        self.thigh_acc_3d:      list = []
+        self._prev_head_vel  = None
+        self._prev_torso_vel = None
+        self._prev_thigh_vel = None
+        self._vehicle_int_pos = np.zeros(3, dtype=np.float32)  # 차량 속도 적분 위치
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -156,11 +183,16 @@ def compute_chest_3ms_clip(torso_acc_g: list, dt: float) -> float:
 
 
 def compute_chest_compression_mm(pos_history: list) -> float:
-    """전후방향(x축) 최대 변위를 흉부 압축량으로 근사 (mm)."""
+    """
+    흉부 압축량 근사 (mm).
+    pos_history 에는 차량 기준 상대 torso 위치가 담겨 있음
+    (InjuryDataCollector.physics_callback 에서 vehicle_pos 를 차감하여 저장).
+    """
     if len(pos_history) < 2:
         return 0.0
     positions = np.stack(pos_history)
-    return float(np.abs(positions[:, 0] - positions[0, 0]).max() * 1000.0)
+    disp = positions - positions[0]
+    return float(np.abs(disp[:, 0]).max() * 1000.0)
 
 
 def compute_nij(head_acc_3d: list) -> float:
@@ -205,7 +237,6 @@ def compute_reward(
     chest_g:              float,
     chest_3ms:            float = 0.0,
     chest_compression_mm: float = 0.0,
-    femur_n:              float = 0.0,
     nij:                  float = 0.0,
     deploy_flags:         list  = None,
 ) -> float:
@@ -213,10 +244,11 @@ def compute_reward(
     에피소드 종료 시 전체 이력 기반 터미널 보상.
     base      = -∑(val/safe)²       — 연속 gradient, 기준 근접 시 관대
     violation = -5 × (초과율)²      — 기준 초과 시 가속적 패널티 (선형→이차)
-    bonus     = +2.0                 — 전 항목 기준 이하
+    bonus     = +2.0                 — 전 항목(5개) 기준 이하
     no_deploy = -2.0                 — 에어백 미전개
+    안전 지표: HIC15, Nij, chest_g, chest_3ms, chest_compression_mm (총 5개)
     """
-    inputs = [hic15, chest_g, chest_3ms, chest_compression_mm, femur_n, nij]
+    inputs = [hic15, chest_g, chest_3ms, chest_compression_mm, nij]
     if any(not np.isfinite(v) for v in inputs):
         return -1000.0
 
@@ -225,7 +257,6 @@ def compute_reward(
         (chest_g,              CHEST_G_SAFE),
         (chest_3ms,            CHEST_3MS_SAFE),
         (chest_compression_mm, CHEST_COMPRESSION_SAFE),
-        (femur_n,              FEMUR_SAFE),
         (nij,                  NIJ_SAFE),
     ]
 
@@ -249,7 +280,6 @@ def compute_step_reward(
     head_acc_g:   list,
     head_acc_3d:  list,
     torso_acc_g:  list,
-    thigh_acc_3d: list,
     torso_pos:    list,
     dt:           float,
     deploy_flags: list = None,
@@ -259,6 +289,7 @@ def compute_step_reward(
     컨트롤 스텝 1개(~16ms 윈도우) 기반 중간 보상.
     compute_reward()와 동일한 이차 패널티, 1/n_steps 스케일링.
     전체 누적 시 터미널 보상과 유사한 크기 유지.
+    안전 지표: HIC15, Nij, chest_g, chest_3ms, chest_compression_mm (총 5개)
     """
     if not head_acc_g and not torso_acc_g:
         return 0.0
@@ -267,10 +298,9 @@ def compute_step_reward(
     chest_g     = float(max(torso_acc_g)) if torso_acc_g else 0.0
     chest_3ms   = compute_chest_3ms_clip(torso_acc_g, dt)
     compression = compute_chest_compression_mm(torso_pos)
-    femur_n     = compute_femur_force_n(thigh_acc_3d)
     nij         = compute_nij(head_acc_3d)
 
-    if any(not np.isfinite(v) for v in [hic15, chest_g, chest_3ms, compression, femur_n, nij]):
+    if any(not np.isfinite(v) for v in [hic15, chest_g, chest_3ms, compression, nij]):
         return 0.0
 
     metrics = [
@@ -278,7 +308,6 @@ def compute_step_reward(
         (chest_g,     CHEST_G_SAFE),
         (chest_3ms,   CHEST_3MS_SAFE),
         (compression, CHEST_COMPRESSION_SAFE),
-        (femur_n,     FEMUR_SAFE),
         (nij,         NIJ_SAFE),
     ]
 

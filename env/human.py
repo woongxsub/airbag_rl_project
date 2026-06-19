@@ -237,6 +237,9 @@ class Human:
         else:
             rel_vel = torso_vel
 
+        # NaN 가드: 초기화 직후 physics_view 값이 유효하지 않을 때
+        if not np.all(np.isfinite(rel_vel)):
+            return
         raw_force = -rel_vel * self._K_BELT
         # 로드 리미터: 절댓값 캡
         norm = float(np.linalg.norm(raw_force))
@@ -339,15 +342,30 @@ class Human:
             return None
 
     def _apply_link_force(self, link_idx: int, force: np.ndarray):
-        """physics_view 로 특정 링크에 힘을 인가."""
+        """physics_view 로 특정 링크에 순수 힘(토크 없음)을 인가.
+
+        pos=zeros 를 쓰면 레버암 = link_world_pos - [0,0,0] 가 되어
+        거대한 토크(수만 N·m)가 발생해 articulation이 폭발한다.
+        적용점을 링크 월드 좌표로 설정하면 레버암=0 → 토크=0.
+        """
         if self._physics_view is None:
             return
         try:
-            n_links = self._physics_view.max_links
-            forces  = np.zeros((1, n_links, 3), dtype=np.float32)
-            torques = np.zeros((1, n_links, 3), dtype=np.float32)
-            pos     = np.zeros((1, n_links, 3), dtype=np.float32)
+            n_links    = self._physics_view.max_links
+            forces     = np.zeros((1, n_links, 3), dtype=np.float32)
+            torques    = np.zeros((1, n_links, 3), dtype=np.float32)
+            pos        = np.zeros((1, n_links, 3), dtype=np.float32)
             forces[0, link_idx] = force
+
+            # 적용점 = 링크 월드 좌표 → 레버암 0, 토크 0
+            transforms = self._get_link_transforms()
+            if transforms is not None:
+                link_pos = np.asarray(transforms[0, link_idx, :3], dtype=np.float32)
+                if np.all(np.isfinite(link_pos)):
+                    pos[0, link_idx] = link_pos
+                else:
+                    return  # 변환 유효하지 않음 → 힘 인가 건너뜀
+
             indices = np.array([0], dtype=np.int32)
             self._physics_view.apply_forces_and_torques_at_position(
                 forces, torques, pos, indices, True

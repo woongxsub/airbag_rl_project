@@ -3,7 +3,7 @@
 
 물리 충돌 모델: rigid wall + compliant contact material
   차량 전면에 crumple zone 등가 재질 적용
-  stiffness=2e5 N/m, damping=1e5 N·s/m
+  stiffness=4.5e5 N/m, damping=1e5 N·s/m
   → 1ms 스텝 내 충격력 유한화, NaN 폭발 방지
 """
 
@@ -44,9 +44,10 @@ _CONTACT_DAMPING   = 1e5    # N·s/m — 임계감쇠 근처 (바운싱 억제)
 
 class AirbagEnv(gym.Env):
     """
-    State  : 11차원 (실차 센서 측정 가능한 값만)
+    State  : 11차원 (실차 센서 측정 가능한 값만, scenario.STATE_DIM=11)
     Action : 15차원 (에어백 5개 × [deploy, timing, pressure])
     Reward : Dense (스텝마다) + Terminal (에피소드 종료 시 bonus/penalty)
+             안전 지표 5개: HIC15, Nij, chest_g, chest_3ms, chest_compression_mm
     """
 
     def __init__(self, headless: bool = True, debug: bool = False):
@@ -60,7 +61,7 @@ class AirbagEnv(gym.Env):
         self.sampler          = ScenarioSampler()
         self._rng             = np.random.default_rng()
         self.scenario         = None
-        self.collector        = InjuryDataCollector(human=None, physics_dt=PHYSICS_DT)
+        self.collector        = InjuryDataCollector(human=None, vehicle_body=None, physics_dt=PHYSICS_DT)
         self._wall            = None
         self.last_raw_actions = None
 
@@ -75,6 +76,14 @@ class AirbagEnv(gym.Env):
     # ── reset ──────────────────────────────────────────────────────────
 
     def reset(self, seed=None, options=None):
+        # 이전 에피소드 콜백을 world.reset() 이전에 먼저 제거
+        # → world.reset() 내부 물리 스텝에서 구 콜백이 실행되는 것을 차단 (addTorque NaN 방지)
+        for cb in ("collect_injury", "apply_forces"):
+            try:
+                self.world.remove_physics_callback(cb)
+            except Exception:
+                pass
+
         self.world.reset()
         self.scenario = self.sampler.sample()
 
@@ -126,22 +135,15 @@ class AirbagEnv(gym.Env):
         self.vehicle.body.set_linear_velocity(init_vel)
         self.human.set_initial_velocity(init_vel)
 
-        self.collector.human = self.human
+        self.collector.human        = self.human
+        self.collector.vehicle_body = self.vehicle.body  # chest_compression 상대 변위 계산용
         self.collector.reset()
-        try:
-            self.world.remove_physics_callback("collect_injury")
-        except Exception:
-            pass
         self.world.add_physics_callback("collect_injury", self.collector.physics_callback)
 
         self._cb_actions  = np.zeros((5, 3), dtype=np.float32)
         self._cb_seatbelt = bool(self.scenario["seatbelt"])
         self._physics_ms  = 0.0
 
-        try:
-            self.world.remove_physics_callback("apply_forces")
-        except Exception:
-            pass
         self.world.add_physics_callback("apply_forces", self._force_physics_callback)
 
         self._step              = 0
@@ -184,14 +186,13 @@ class AirbagEnv(gym.Env):
 
         # Dense reward: 이번 스텝 윈도우 (~17ms)
         reward = compute_step_reward(
-            head_acc_g   = self.collector.head_acc_g[prev_count:curr_count],
-            head_acc_3d  = self.collector.head_acc_3d[prev_count:curr_count],
-            torso_acc_g  = self.collector.torso_acc_g[prev_count:curr_count],
-            thigh_acc_3d = self.collector.thigh_acc_3d[prev_count:curr_count],
-            torso_pos    = self.collector.torso_pos_history[prev_count:curr_count],
-            dt           = PHYSICS_DT,
-            deploy_flags = deploy_flags,
-            n_steps      = COLLISION_STEPS,
+            head_acc_g          = self.collector.head_acc_g[prev_count:curr_count],
+            head_acc_3d         = self.collector.head_acc_3d[prev_count:curr_count],
+            torso_acc_g         = self.collector.torso_acc_g[prev_count:curr_count],
+            torso_pos           = self.collector.torso_pos_history[prev_count:curr_count],
+            dt                  = PHYSICS_DT,
+            deploy_flags        = deploy_flags,
+            n_steps             = COLLISION_STEPS,
         )
 
         done = self._step >= COLLISION_STEPS
@@ -202,13 +203,15 @@ class AirbagEnv(gym.Env):
             hic15       = compute_hic15(self.collector.head_acc_g, dt)
             chest_g     = compute_chest_g(self.collector.torso_acc_g)
             chest_3ms   = compute_chest_3ms_clip(self.collector.torso_acc_g, dt)
-            compression = compute_chest_compression_mm(self.collector.torso_pos_history)
+            compression = compute_chest_compression_mm(
+                self.collector.torso_pos_history,
+            )
             femur_n     = compute_femur_force_n(self.collector.thigh_acc_3d)
             nij         = compute_nij(self.collector.head_acc_3d)
 
             terminal_reward = compute_reward(
                 hic15=hic15, chest_g=chest_g, chest_3ms=chest_3ms,
-                chest_compression_mm=compression, femur_n=femur_n,
+                chest_compression_mm=compression,
                 nij=nij, deploy_flags=deploy_flags,
             )
             reward += terminal_reward
