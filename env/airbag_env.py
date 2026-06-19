@@ -140,6 +140,8 @@ class AirbagEnv(gym.Env):
         self.collector.reset()
         self.world.add_physics_callback("collect_injury", self.collector.physics_callback)
 
+        self.human.reset_belt_reference()  # 안전벨트 스프링 기준위치 초기화
+
         self._cb_actions  = np.zeros((5, 3), dtype=np.float32)
         self._cb_seatbelt = bool(self.scenario["seatbelt"])
         self._physics_ms  = 0.0
@@ -331,12 +333,14 @@ class AirbagEnv(gym.Env):
         self._physics_ms += step_size * 1000.0
         if self.human is None:
             return
-        self.human.apply_seatbelt(self._cb_seatbelt, self.vehicle.body)
+        self.human.apply_seatbelt(self._cb_seatbelt, self.vehicle.body,
+                                   step_dt=step_size)
         if self.airbag_sys is not None and self.scenario is not None:
             self.airbag_sys.apply_forces(
                 self._cb_actions,
                 self.scenario["angle"],
                 self._physics_ms,
+                step_dt=step_size,
             )
 
     # ── 내부 ───────────────────────────────────────────────────────────
