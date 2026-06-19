@@ -1,4 +1,5 @@
 import numpy as np
+from env.airbag import PRESSURE_OPT
 
 
 def rule_based_policy(
@@ -29,8 +30,24 @@ def rule_based_policy(
     반환: shape (5, 3) — 각 행 [deploy, timing_ms, pressure_kPa]
     타이밍·압력은 고정값 사용 (최적화 없음, Rule-Based 베이스라인 전용).
     """
-    FIXED_TIMING   = 15.0   # ms
-    FIXED_PRESSURE = 300.0  # kPa
+    # 타이밍 근거 (15 ms 고정값):
+    #   출처1: Airbag24, "What is an SRS Control Unit? Function Explained"
+    #     https://www.airbag24.de/en/blogs/guide/srs-control-unit
+    #     인용: "Within 10 ms, the control unit determines crash type and severity"
+    #   출처2: US Patent 6460882, "Airbag actuation event discrimination system"
+    #     https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/6460882
+    #     인용: "The algorithm calculations begin at around 10 ms ... terminates at around 17.5 ms"
+    #   출처3: AllAirbags, "How Fast Do Airbags Deploy?"
+    #     https://allairbags.com/blogs/our-blog/how-fast-do-airbags-deploy
+    #     인용: "Signal sent (10-15 ms): The ACU determines if airbag deployment is needed."
+    #   → 3개 출처 공통 판단 구간 10~18 ms. 15 ms는 이 구간 내 합리적 고정값.
+    FIXED_TIMING = 15.0  # ms
+
+    # 압력 근거: 본 시뮬레이션 압력-감쇠 모델(Reverse U-Curve)에서
+    #   감쇠 효율이 이론적으로 최대인 지점 = PRESSURE_OPT(130.0 kPa).
+    #   실측 데이터가 아닌 시뮬레이션 모델상의 최적점임.
+    #   Action 탐색 범위 자체는 실측 문헌(0~250 kPa) 기반으로 현실화되어 있음.
+    FIXED_PRESSURE = PRESSURE_OPT  # 130.0 kPa
 
     deploy = np.zeros(5, dtype=np.float32)
 

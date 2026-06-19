@@ -188,13 +188,11 @@ class AirbagEnv(gym.Env):
 
         # Dense reward: 이번 스텝 윈도우 (~17ms)
         reward = compute_step_reward(
-            head_acc_g          = self.collector.head_acc_g[prev_count:curr_count],
-            head_acc_3d         = self.collector.head_acc_3d[prev_count:curr_count],
-            torso_acc_g         = self.collector.torso_acc_g[prev_count:curr_count],
-            torso_pos           = self.collector.torso_pos_history[prev_count:curr_count],
-            dt                  = PHYSICS_DT,
-            deploy_flags        = deploy_flags,
-            n_steps             = COLLISION_STEPS,
+            head_acc_g   = self.collector.head_acc_g[prev_count:curr_count],
+            torso_acc_g  = self.collector.torso_acc_g[prev_count:curr_count],
+            dt           = PHYSICS_DT,
+            deploy_flags = deploy_flags,
+            n_steps      = COLLISION_STEPS,
         )
 
         done = self._step >= COLLISION_STEPS
@@ -212,9 +210,8 @@ class AirbagEnv(gym.Env):
             nij         = compute_nij(self.collector.head_acc_3d)
 
             terminal_reward = compute_reward(
-                hic15=hic15, chest_g=chest_g, chest_3ms=chest_3ms,
-                chest_compression_mm=compression,
-                nij=nij, deploy_flags=deploy_flags,
+                hic15=hic15, chest_g=chest_g,
+                deploy_flags=deploy_flags,
             )
             reward += terminal_reward
             info = {
@@ -369,11 +366,13 @@ class AirbagEnv(gym.Env):
             self._wall.set_world_pose(position=wall_pos, orientation=wall_quat)
 
     def _parse_action(self, action: np.ndarray) -> np.ndarray:
+        # 압력 Action 범위: 0~1 → 0~250 kPa (실측 기반 현실화)
+        # 출처: US Patent 9623831 (80~250 kPa), ResearchGate 충돌 실험 (47~53 kPa)
         result = np.zeros((5, 3), dtype=np.float32)
         for i in range(5):
             deploy = float(action[i] > 0.5)
             result[i, 0] = deploy
             if deploy:
                 result[i, 1] = action[5  + i] * TIMING_MAX_MS
-                result[i, 2] = action[10 + i] * 600.0
+                result[i, 2] = action[10 + i] * 250.0
         return result

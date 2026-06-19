@@ -36,7 +36,14 @@ AIRBAG_LOCAL_POSITIONS = {
     4: np.array([0.10,  0.65, 1.50]),
 }
 
-PRESSURE_OPT = 300.0
+# 출처 1: ResearchGate, "Airbag pressures for the different simulation conditions"
+#   https://www.researchgate.net/figure/Airbag-pressures-for-the-different-simulation-conditions_fig2_361562872
+#   인용: "In the 69 km/h crash, peak in-crash airbag pressures of 47-53 kPa were measured"
+# 출처 2: US Patent 9623831, "Three-chamber frontal impact airbag with controlled pressure differentials"
+#   https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/9623831
+#   인용: "the gas pressure of the center chamber is approximately 80 to approximately 250 kPa"
+# → 실측 범위 0~250 kPa의 중간값(이론적 감쇠 최적점)으로 설정
+PRESSURE_OPT = 130.0
 DAMPING_BASE = 0.75
 INFLATE_MS   = 50.0
 BASE_FORCE   = 500.0

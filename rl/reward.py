@@ -15,10 +15,10 @@ from scipy.ndimage import minimum_filter1d
 # ── NHTSA / FMVSS 안전 기준선 ────────────────────────────────────────────
 HIC_SAFE               = 700.0
 CHEST_G_SAFE           = 60.0    # 흉부 최대 합성가속도 (g)
-CHEST_3MS_SAFE         = 60.0    # 흉부 3ms 클립 (g)
-CHEST_COMPRESSION_SAFE = 50.0    # 흉부 압축량 (mm)
-FEMUR_SAFE             = 10_000.0 # 대퇴부 압축력 (N) — 현재 무릎 에어백 미구현으로 보상함수에서 제외함
-NIJ_SAFE               = 1.0     # 목 상해 지수 Nij
+CHEST_3MS_SAFE         = 60.0    # 흉부 3ms 클립 (g)            — 현재 보상함수 미사용 (chest_g 중복), 로깅용 유지
+CHEST_COMPRESSION_SAFE = 50.0    # 흉부 압축량 (mm)             — 현재 보상함수 미사용 (측정 한계), 로깅용 유지
+FEMUR_SAFE             = 10_000.0 # 대퇴부 압축력 (N)            — 현재 무릎 에어백 미구현으로 보상함수에서 제외, 로깅용 유지
+NIJ_SAFE               = 1.0     # 목 상해 지수 Nij              — 현재 보상함수 미사용 (HIC15 중복), 로깅용 유지
 
 # ── Hybrid III 참조값 (NHTSA 표준) ──────────────────────────────────────
 HEAD_MASS_KG      = 4.54     # 두부 질량
@@ -171,6 +171,9 @@ def compute_chest_3ms_clip(torso_acc_g: list, dt: float) -> float:
     """
     흉부 3ms 클립 가속도: 최소 3ms 연속 지속되는 최고 가속도 (g).
     슬라이딩 윈도우 최솟값의 최댓값으로 구현 (scipy.ndimage).
+
+    현재 보상함수에서는 미사용 (chest_g와 동일 원천 데이터 파생, 중복성 높음).
+    로깅/분석용으로만 유지.
     """
     arr = np.asarray(torso_acc_g, dtype=np.float64)
     if len(arr) == 0:
@@ -187,6 +190,10 @@ def compute_chest_compression_mm(pos_history: list) -> float:
     흉부 압축량 근사 (mm).
     pos_history 에는 차량 기준 상대 torso 위치가 담겨 있음
     (InjuryDataCollector.physics_callback 에서 vehicle_pos 를 차감하여 저장).
+
+    알려진 한계: 차량의 탄성 반동(bounce)이 발생하면 vehicle_int_pos가 역방향으로
+    적분되어 후방 변위까지 압축량으로 잘못 측정될 수 있음.
+    보상함수 미사용 및 발표 자료 미포함으로 이번 프로젝트 범위에서는 수정하지 않음.
     """
     if len(pos_history) < 2:
         return 0.0
@@ -202,6 +209,9 @@ def compute_nij(head_acc_3d: list) -> float:
     My = m_head × ax × lever_arm (시상면 굽힘 모멘트)
 
     NHTSA FMVSS 208 표준. 기준: 1.0 이하.
+
+    현재 보상함수에서는 미사용 (HIC15와 동일 원천 데이터 파생, 중복성 높음).
+    로깅/분석용으로만 유지.
     """
     if not head_acc_3d:
         return 0.0
@@ -233,31 +243,30 @@ def compute_femur_force_n(thigh_acc_3d: list) -> float:
 # ══════════════════════════════════════════════════════════════════════════
 
 def compute_reward(
-    hic15:                float,
-    chest_g:              float,
-    chest_3ms:            float = 0.0,
-    chest_compression_mm: float = 0.0,
-    nij:                  float = 0.0,
-    deploy_flags:         list  = None,
+    hic15:        float,
+    chest_g:      float,
+    deploy_flags: list = None,
 ) -> float:
     """
     에피소드 종료 시 전체 이력 기반 터미널 보상.
-    base      = -∑(val/safe)²       — 연속 gradient, 기준 근접 시 관대
-    violation = -5 × (초과율)²      — 기준 초과 시 가속적 패널티 (선형→이차)
-    bonus     = +2.0                 — 전 항목(5개) 기준 이하
-    no_deploy = -2.0                 — 에어백 미전개
-    안전 지표: HIC15, Nij, chest_g, chest_3ms, chest_compression_mm (총 5개)
+    base      = -∑(val/safe)²  — 연속 gradient, 기준 근접 시 관대
+    violation = -5 × (초과율)² — 기준 초과 시 가속적 패널티 (선형→이차)
+    bonus     = +2.0            — 2개 지표 전부 기준 이하
+    no_deploy = -2.0            — 에어백 미전개
+
+    안전 지표: HIC15, chest_g (총 2개)
+    제외 지표(로깅용 유지, 보상 계산 제외):
+      - Nij            : HIC15와 동일 원천 파생, 중복
+      - chest_3ms      : chest_g와 동일 원천 파생, 중복
+      - chest_compression_mm : 측정 한계 (차량 탄성 반동 측정 오류)
+      - femur_force    : 무릎 에어백 미구현
     """
-    inputs = [hic15, chest_g, chest_3ms, chest_compression_mm, nij]
-    if any(not np.isfinite(v) for v in inputs):
+    if not (np.isfinite(hic15) and np.isfinite(chest_g)):
         return -1000.0
 
     metrics = [
-        (hic15,                HIC_SAFE),
-        (chest_g,              CHEST_G_SAFE),
-        (chest_3ms,            CHEST_3MS_SAFE),
-        (chest_compression_mm, CHEST_COMPRESSION_SAFE),
-        (nij,                  NIJ_SAFE),
+        (hic15,   HIC_SAFE),
+        (chest_g, CHEST_G_SAFE),
     ]
 
     r = sum(-(val / safe) ** 2 for val, safe in metrics)
@@ -278,9 +287,7 @@ def compute_reward(
 
 def compute_step_reward(
     head_acc_g:   list,
-    head_acc_3d:  list,
     torso_acc_g:  list,
-    torso_pos:    list,
     dt:           float,
     deploy_flags: list = None,
     n_steps:      int  = 60,
@@ -289,26 +296,22 @@ def compute_step_reward(
     컨트롤 스텝 1개(~16ms 윈도우) 기반 중간 보상.
     compute_reward()와 동일한 이차 패널티, 1/n_steps 스케일링.
     전체 누적 시 터미널 보상과 유사한 크기 유지.
-    안전 지표: HIC15, Nij, chest_g, chest_3ms, chest_compression_mm (총 5개)
+
+    안전 지표: HIC15, chest_g (총 2개)
+    제외 지표(compute_reward 참조)는 여기서도 동일하게 미사용.
     """
     if not head_acc_g and not torso_acc_g:
         return 0.0
 
-    hic15       = compute_hic15(head_acc_g, dt)
-    chest_g     = float(max(torso_acc_g)) if torso_acc_g else 0.0
-    chest_3ms   = compute_chest_3ms_clip(torso_acc_g, dt)
-    compression = compute_chest_compression_mm(torso_pos)
-    nij         = compute_nij(head_acc_3d)
+    hic15   = compute_hic15(head_acc_g, dt)
+    chest_g = float(max(torso_acc_g)) if torso_acc_g else 0.0
 
-    if any(not np.isfinite(v) for v in [hic15, chest_g, chest_3ms, compression, nij]):
+    if not (np.isfinite(hic15) and np.isfinite(chest_g)):
         return 0.0
 
     metrics = [
-        (hic15,       HIC_SAFE),
-        (chest_g,     CHEST_G_SAFE),
-        (chest_3ms,   CHEST_3MS_SAFE),
-        (compression, CHEST_COMPRESSION_SAFE),
-        (nij,         NIJ_SAFE),
+        (hic15,   HIC_SAFE),
+        (chest_g, CHEST_G_SAFE),
     ]
 
     scale = 1.0 / n_steps
