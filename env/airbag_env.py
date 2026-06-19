@@ -50,7 +50,8 @@ class AirbagEnv(gym.Env):
              안전 지표 5개: HIC15, Nij, chest_g, chest_3ms, chest_compression_mm
     """
 
-    def __init__(self, headless: bool = True, debug: bool = False):
+    def __init__(self, headless: bool = True, debug: bool = False,
+                 violation_coeff: float = 5.0):
         super().__init__()
         self.world = World(
             physics_dt=PHYSICS_DT,
@@ -69,7 +70,8 @@ class AirbagEnv(gym.Env):
         self._cb_seatbelt = False
         self._physics_ms  = 0.0
 
-        self.debug = debug
+        self.debug           = debug
+        self.violation_coeff = violation_coeff  # 커리큘럼 단계에서 외부 갱신 가능
         self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(STATE_DIM,), dtype=np.float32)
         self.action_space      = spaces.Box(low=0.0, high=1.0, shape=(15,), dtype=np.float32)
 
@@ -188,11 +190,12 @@ class AirbagEnv(gym.Env):
 
         # Dense reward: 이번 스텝 윈도우 (~17ms)
         reward = compute_step_reward(
-            head_acc_g   = self.collector.head_acc_g[prev_count:curr_count],
-            torso_acc_g  = self.collector.torso_acc_g[prev_count:curr_count],
-            dt           = PHYSICS_DT,
-            deploy_flags = deploy_flags,
-            n_steps      = COLLISION_STEPS,
+            head_acc_g      = self.collector.head_acc_g[prev_count:curr_count],
+            torso_acc_g     = self.collector.torso_acc_g[prev_count:curr_count],
+            dt              = PHYSICS_DT,
+            deploy_flags    = deploy_flags,
+            n_steps         = COLLISION_STEPS,
+            violation_coeff = self.violation_coeff,
         )
 
         done = self._step >= COLLISION_STEPS
@@ -212,6 +215,7 @@ class AirbagEnv(gym.Env):
             terminal_reward = compute_reward(
                 hic15=hic15, chest_g=chest_g,
                 deploy_flags=deploy_flags,
+                violation_coeff=self.violation_coeff,
             )
             reward += terminal_reward
             info = {

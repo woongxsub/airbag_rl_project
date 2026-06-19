@@ -32,20 +32,57 @@ SPINE_TILT_MAX_DEG =  20.0
 
 
 class ScenarioSampler:
+    """
+    충돌 시나리오 샘플러.
+
+    stage 속성으로 커리큘럼 단계 제어 (외부에서 직접 변경):
+      0 = Pure PPO — 전 범위 (기본값)
+      1 = Stage 1  — 정면±45°, 30-60 km/h, 전복 없음   (관대)
+      2 = Stage 2  — 전 각도,   30-90 km/h, 전복 5%    (중간, 누적 확장)
+      3 = Stage 3  — 전 각도,  20-120 km/h, 전복 15%   (전 범위, 누적 확장)
+
+    각도는 Stage 1(정면±45°)→ Stage 2/3(전 범위) 이분법적 확장.
+    속도는 누적 확장형 (이전 범위 포함하며 상한 확대).
+    """
+
     def __init__(self, seed=None):
-        self.rng = np.random.default_rng(seed)
+        self.rng   = np.random.default_rng(seed)
+        self.stage = 0  # 외부(train.py 루프)에서 에피소드마다 갱신
 
     def sample(self) -> dict:
         """충돌 시나리오 + 체형 파라미터 샘플링."""
+        s = self.stage
+
+        # ── 충돌 각도 ────────────────────────────────────────────────────
+        if s == 1:
+            # 정면 충돌: 315~360° 또는 0~45° (각 50% 확률)
+            if self.rng.random() < 0.5:
+                angle = float(self.rng.uniform(315.0, 360.0))
+            else:
+                angle = float(self.rng.uniform(0.0, 45.0))
+        else:
+            angle = float(self.rng.uniform(0.0, 360.0))
+
+        # ── 충돌 속도 (누적 확장형) ──────────────────────────────────────
+        if s == 1:
+            speed = float(self.rng.uniform(30.0, 60.0))
+        elif s == 2:
+            speed = float(self.rng.uniform(30.0, 90.0))   # Stage 1 범위 포함
+        else:
+            speed = float(self.rng.uniform(20.0, 120.0))  # 전 범위 (Stage 3 & Pure)
+
+        # ── 전복 확률 ────────────────────────────────────────────────────
+        # 실차 rollover sensor(자이로/각속도계)에 대응.
+        rollover_prob = {0: 0.05, 1: 0.00, 2: 0.05, 3: 0.15}.get(s, 0.05)
+
         return {
-            "angle":             float(self.rng.uniform(0, 360)),
-            "speed":             float(self.rng.uniform(20, 120)),
+            "angle":             angle,
+            "speed":             speed,
             "seatbelt":          bool(self.rng.integers(0, 2)),
             "height":            float(self.rng.uniform(1.55, 1.90)),
             "weight":            float(self.rng.uniform(50.0, 100.0)),
-            # 전복: 실차 rollover sensor(자이로/각속도계)에 대응. 약 5% 확률로 발생.
-            "is_rollover":       bool(self.rng.random() < 0.05),
-            # 동승자 점유: OCS(Occupant Classification System) 시트 센서에 대응.
+            "is_rollover":       bool(self.rng.random() < rollover_prob),
+            # OCS(Occupant Classification System) 시트 센서에 대응.
             "passenger_present": bool(self.rng.integers(0, 2)),
         }
 

@@ -243,9 +243,10 @@ def compute_femur_force_n(thigh_acc_3d: list) -> float:
 # ══════════════════════════════════════════════════════════════════════════
 
 def compute_reward(
-    hic15:        float,
-    chest_g:      float,
-    deploy_flags: list = None,
+    hic15:           float,
+    chest_g:         float,
+    deploy_flags:    list  = None,
+    violation_coeff: float = _VIOLATION_COEFF,
 ) -> float:
     """
     에피소드 종료 시 전체 이력 기반 터미널 보상.
@@ -274,7 +275,7 @@ def compute_reward(
     for val, safe in metrics:
         if val > safe:
             excess = val / safe - 1.0
-            r -= _VIOLATION_COEFF * excess ** 2
+            r -= violation_coeff * excess ** 2
 
     if all(val <= safe for val, safe in metrics):
         r += _SAFETY_BONUS
@@ -286,11 +287,12 @@ def compute_reward(
 
 
 def compute_step_reward(
-    head_acc_g:   list,
-    torso_acc_g:  list,
-    dt:           float,
-    deploy_flags: list = None,
-    n_steps:      int  = 60,
+    head_acc_g:      list,
+    torso_acc_g:     list,
+    dt:              float,
+    deploy_flags:    list  = None,
+    n_steps:         int   = 60,
+    violation_coeff: float = _VIOLATION_COEFF,
 ) -> float:
     """
     컨트롤 스텝 1개(~16ms 윈도우) 기반 중간 보상.
@@ -320,7 +322,7 @@ def compute_step_reward(
     for val, safe in metrics:
         if val > safe:
             excess = val / safe - 1.0
-            r -= _VIOLATION_COEFF * excess ** 2 * scale
+            r -= violation_coeff * excess ** 2 * scale
 
     if deploy_flags is not None and sum(deploy_flags) == 0:
         r -= _NO_DEPLOY_PEN * scale
