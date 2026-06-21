@@ -72,6 +72,18 @@ class AirbagEnv(gym.Env):
 
         self.debug           = debug
         self.violation_coeff = violation_coeff  # 커리큘럼 단계에서 외부 갱신 가능
+
+        # 하이브리드 커리큘럼 보상 가중치 (외부에서 에피소드마다 갱신)
+        self.correct_weight   = 0.0
+        self.wrong_weight     = 0.0
+        self.over_weight      = 0.0
+        self.late_weight      = 0.0
+        self.peak_weight      = 0.0
+
+        # 에피소드 내 최대 가속도 추적 (peak_penalty용)
+        self.max_head_acc_g   = 0.0
+        self.max_torso_acc_g  = 0.0
+
         self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(STATE_DIM,), dtype=np.float32)
         self.action_space      = spaces.Box(low=0.0, high=1.0, shape=(15,), dtype=np.float32)
 
@@ -152,6 +164,8 @@ class AirbagEnv(gym.Env):
 
         self._step              = 0
         self._prev_sample_count = 0
+        self.max_head_acc_g     = 0.0
+        self.max_torso_acc_g    = 0.0
 
         obs = self.sampler.to_state_vector(self.scenario)
         return obs, {}
@@ -177,6 +191,14 @@ class AirbagEnv(gym.Env):
         curr_count = len(self.collector.head_acc_g)
         self._prev_sample_count = curr_count
 
+        # 에피소드 최대 가속도 추적 (peak_penalty용)
+        _head_win  = self.collector.head_acc_g[prev_count:curr_count]
+        _torso_win = self.collector.torso_acc_g[prev_count:curr_count]
+        if _head_win:
+            self.max_head_acc_g  = max(self.max_head_acc_g,  max(_head_win))
+        if _torso_win:
+            self.max_torso_acc_g = max(self.max_torso_acc_g, max(_torso_win))
+
         if self.debug:
             print(
                 f"[step {self._step:02d}] "
@@ -186,16 +208,25 @@ class AirbagEnv(gym.Env):
                 flush=True,
             )
 
-        deploy_flags = [raw_actions[i, 0] > 0.5 for i in range(5)]
+        deploy_flags   = [raw_actions[i, 0] > 0.5 for i in range(5)]
+        timing_ms_list = [float(raw_actions[i, 1]) for i in range(5)]   # _parse_action에서 이미 ms 단위
 
         # Dense reward: 이번 스텝 윈도우 (~17ms)
         reward = compute_step_reward(
-            head_acc_g      = self.collector.head_acc_g[prev_count:curr_count],
-            torso_acc_g     = self.collector.torso_acc_g[prev_count:curr_count],
-            dt              = PHYSICS_DT,
-            deploy_flags    = deploy_flags,
-            n_steps         = COLLISION_STEPS,
-            violation_coeff = self.violation_coeff,
+            head_acc_g        = self.collector.head_acc_g[prev_count:curr_count],
+            torso_acc_g       = self.collector.torso_acc_g[prev_count:curr_count],
+            dt                = PHYSICS_DT,
+            deploy_flags      = deploy_flags,
+            n_steps           = COLLISION_STEPS,
+            violation_coeff   = self.violation_coeff,
+            angle             = float(self.scenario.get("angle", 0.0)),
+            is_rollover       = bool(self.scenario.get("is_rollover", False)),
+            passenger_present = bool(self.scenario.get("passenger_present", True)),
+            correct_weight    = self.correct_weight,
+            wrong_weight      = self.wrong_weight,
+            over_weight       = self.over_weight,
+            timing_ms_list    = timing_ms_list,
+            late_weight       = self.late_weight,
         )
 
         done = self._step >= COLLISION_STEPS
@@ -214,8 +245,19 @@ class AirbagEnv(gym.Env):
 
             terminal_reward = compute_reward(
                 hic15=hic15, chest_g=chest_g,
-                deploy_flags=deploy_flags,
-                violation_coeff=self.violation_coeff,
+                deploy_flags      = deploy_flags,
+                violation_coeff   = self.violation_coeff,
+                angle             = float(self.scenario.get("angle", 0.0)),
+                is_rollover       = bool(self.scenario.get("is_rollover", False)),
+                passenger_present = bool(self.scenario.get("passenger_present", True)),
+                correct_weight    = self.correct_weight,
+                wrong_weight      = self.wrong_weight,
+                over_weight       = self.over_weight,
+                timing_ms_list    = timing_ms_list,
+                late_weight       = self.late_weight,
+                max_head_acc_g    = self.max_head_acc_g,
+                max_torso_acc_g   = self.max_torso_acc_g,
+                peak_weight       = self.peak_weight,
             )
             reward += terminal_reward
             info = {

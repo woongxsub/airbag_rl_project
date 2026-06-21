@@ -35,6 +35,9 @@ _VIOLATION_COEFF = 5.0
 _SAFETY_BONUS    = 2.0
 _NO_DEPLOY_PEN   = 2.0
 
+# ── peak_penalty 참조값 ──────────────────────────────────────────────────
+HEAD_ACC_PEAK_REF = 80.0  # g — NHTSA 두부 충격 가속도 한계 근사
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # 1. 데이터 수집기
@@ -239,28 +242,166 @@ def compute_femur_force_n(thigh_acc_3d: list) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 4. RL 보상 함수
+# 4. 방향 / 타이밍 / 피크 보조 보상 함수 (하이브리드 커리큘럼용)
+# ══════════════════════════════════════════════════════════════════════════
+
+def _get_correct_airbags(
+    angle: float,
+    is_rollover: bool,
+    passenger_present: bool = True,
+) -> set:
+    """충돌 각도/전복 → 정방향 에어백 인덱스 집합 (Hyundai NX4 2025 룰)."""
+    if is_rollover:
+        correct = {2, 3, 4}
+    elif angle <= 45 or angle >= 315:   # 정면
+        correct = {0, 1}
+    elif 45 < angle <= 135:             # 우측 측면
+        correct = {3, 4}
+    elif 135 < angle <= 225:            # 후면
+        correct = set()
+    else:                               # 좌측 측면 225~315
+        correct = {2, 4}
+    if not passenger_present:
+        correct -= {1, 3}
+    return correct
+
+
+def compute_direction_match_bonus(
+    angle: float,
+    is_rollover: bool,
+    deploy_flags: list,
+    passenger_present: bool = True,
+    correct_weight: float = 0.0,
+    wrong_weight: float = 0.0,
+) -> float:
+    """
+    정방향 에어백 일치 보상 / 오전개 패널티.
+
+    후면(correct_set={}): 미전개=완전 보상, 전개=오전개 패널티.
+    그 외:
+      match_ratio = |correct ∩ deployed| / |correct|   (0~1)
+      wrong_ratio = |deployed − correct| / 5           (0~1)
+      return +correct_weight × match_ratio − wrong_weight × wrong_ratio
+    """
+    if correct_weight == 0.0 and wrong_weight == 0.0:
+        return 0.0
+
+    correct_set  = _get_correct_airbags(angle, is_rollover, passenger_present)
+    deployed_set = {i for i, d in enumerate(deploy_flags) if float(d) > 0.5}
+
+    if len(correct_set) == 0:
+        if len(deployed_set) == 0:
+            return float(correct_weight)           # 후면 미전개 = 정답
+        return float(-wrong_weight * len(deployed_set) / 5.0)
+
+    match_ratio = len(correct_set & deployed_set) / len(correct_set)
+    wrong_ratio = len(deployed_set - correct_set) / 5.0
+    return float(correct_weight * match_ratio - wrong_weight * wrong_ratio)
+
+
+def compute_over_deploy_penalty(
+    angle: float,
+    is_rollover: bool,
+    deploy_flags: list,
+    passenger_present: bool = True,
+    over_weight: float = 0.0,
+) -> float:
+    """
+    과전개 패널티 — 정방향 이외 에어백을 추가로 전개했을 때.
+    penalty = over_weight × n_extra / 5
+    """
+    if over_weight == 0.0:
+        return 0.0
+    correct_set  = _get_correct_airbags(angle, is_rollover, passenger_present)
+    deployed_set = {i for i, d in enumerate(deploy_flags) if float(d) > 0.5}
+    n_extra = len(deployed_set - correct_set)
+    return float(-over_weight * n_extra / 5.0)
+
+
+def compute_late_deploy_penalty(
+    timing_ms_list: list,
+    deploy_flags: list,
+    baseline_timing_ms: float = 15.0,
+    tolerance_ms: float = 5.0,
+    late_weight: float = 0.0,
+) -> float:
+    """
+    에어백 전개 타이밍 패널티 — 양방향.
+
+    허용 범위 [baseline − tolerance, baseline + tolerance] = [10ms, 20ms].
+    이탈 거리를 tolerance_ms(5ms)로 정규화 → 5ms 이탈 = penalty_i 1.0.
+    대칭 정규화: 이른 전개와 늦은 전개를 동등하게 처벌.
+    return = −late_weight × mean(penalty_i for deployed airbags)
+    """
+    if late_weight == 0.0 or not timing_ms_list:
+        return 0.0
+
+    lower = baseline_timing_ms - tolerance_ms   # 10ms
+    upper = baseline_timing_ms + tolerance_ms   # 20ms
+
+    total_penalty = 0.0
+    n_deployed = 0
+    for deploy, timing_ms in zip(deploy_flags, timing_ms_list):
+        if float(deploy) > 0.5:
+            n_deployed += 1
+            if timing_ms < lower:
+                total_penalty += (lower - timing_ms) / tolerance_ms
+            elif timing_ms > upper:
+                total_penalty += (timing_ms - upper) / tolerance_ms
+
+    if n_deployed == 0:
+        return 0.0
+    return float(-late_weight * total_penalty / n_deployed)
+
+
+def compute_peak_penalty(
+    max_head_acc_g: float,
+    max_torso_acc_g: float,
+    peak_weight: float = 0.0,
+) -> float:
+    """
+    에피소드 전체 최대 가속도 이차 패널티.
+    head: HEAD_ACC_PEAK_REF(80g), torso: CHEST_G_SAFE(60g) 기준.
+    /2 정규화로 각 항 합산 스케일 유지.
+    """
+    if peak_weight == 0.0:
+        return 0.0
+    head_norm  = max_head_acc_g  / HEAD_ACC_PEAK_REF
+    torso_norm = max_torso_acc_g / CHEST_G_SAFE
+    return float(-peak_weight * (head_norm ** 2 + torso_norm ** 2) / 2.0)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 5. RL 보상 함수
 # ══════════════════════════════════════════════════════════════════════════
 
 def compute_reward(
-    hic15:           float,
-    chest_g:         float,
-    deploy_flags:    list  = None,
-    violation_coeff: float = _VIOLATION_COEFF,
+    hic15:              float,
+    chest_g:            float,
+    deploy_flags:       list  = None,
+    violation_coeff:    float = _VIOLATION_COEFF,
+    # ── 하이브리드 커리큘럼 신규 파라미터 (기본=0 → 구 코드와 완전 호환) ──
+    angle:              float = 0.0,
+    is_rollover:        bool  = False,
+    passenger_present:  bool  = True,
+    correct_weight:     float = 0.0,
+    wrong_weight:       float = 0.0,
+    over_weight:        float = 0.0,
+    timing_ms_list:     list  = None,
+    baseline_timing_ms: float = 15.0,
+    tolerance_ms:       float = 5.0,
+    late_weight:        float = 0.0,
+    max_head_acc_g:     float = 0.0,
+    max_torso_acc_g:    float = 0.0,
+    peak_weight:        float = 0.0,
 ) -> float:
     """
     에피소드 종료 시 전체 이력 기반 터미널 보상.
     base      = -∑(val/safe)²  — 연속 gradient, 기준 근접 시 관대
-    violation = -5 × (초과율)² — 기준 초과 시 가속적 패널티 (선형→이차)
+    violation = -coeff×(초과율)² — 기준 초과 시 가속적 패널티
     bonus     = +2.0            — 2개 지표 전부 기준 이하
     no_deploy = -2.0            — 에어백 미전개
-
-    안전 지표: HIC15, chest_g (총 2개)
-    제외 지표(로깅용 유지, 보상 계산 제외):
-      - Nij            : HIC15와 동일 원천 파생, 중복
-      - chest_3ms      : chest_g와 동일 원천 파생, 중복
-      - chest_compression_mm : 측정 한계 (차량 탄성 반동 측정 오류)
-      - femur_force    : 무릎 에어백 미구현
+    + 방향일치 / 과전개 / 타이밍 / 피크 항 (가중치=0이면 skip)
     """
     if not (np.isfinite(hic15) and np.isfinite(chest_g)):
         return -1000.0
@@ -283,24 +424,50 @@ def compute_reward(
     if deploy_flags is not None and sum(deploy_flags) == 0:
         r -= _NO_DEPLOY_PEN
 
+    # ── 신규 보상항 ───────────────────────────────────────────────────────
+    flags = deploy_flags or []
+    if correct_weight or wrong_weight:
+        r += compute_direction_match_bonus(
+            angle, is_rollover, flags, passenger_present, correct_weight, wrong_weight,
+        )
+    if over_weight:
+        r += compute_over_deploy_penalty(
+            angle, is_rollover, flags, passenger_present, over_weight,
+        )
+    if late_weight and timing_ms_list:
+        r += compute_late_deploy_penalty(
+            timing_ms_list, flags, baseline_timing_ms, tolerance_ms, late_weight,
+        )
+    if peak_weight:
+        r += compute_peak_penalty(max_head_acc_g, max_torso_acc_g, peak_weight)
+
     return float(r)
 
 
 def compute_step_reward(
-    head_acc_g:      list,
-    torso_acc_g:     list,
-    dt:              float,
-    deploy_flags:    list  = None,
-    n_steps:         int   = 60,
-    violation_coeff: float = _VIOLATION_COEFF,
+    head_acc_g:         list,
+    torso_acc_g:        list,
+    dt:                 float,
+    deploy_flags:       list  = None,
+    n_steps:            int   = 60,
+    violation_coeff:    float = _VIOLATION_COEFF,
+    # ── 하이브리드 커리큘럼 신규 파라미터 (기본=0 → 구 코드와 완전 호환) ──
+    angle:              float = 0.0,
+    is_rollover:        bool  = False,
+    passenger_present:  bool  = True,
+    correct_weight:     float = 0.0,
+    wrong_weight:       float = 0.0,
+    over_weight:        float = 0.0,
+    timing_ms_list:     list  = None,
+    baseline_timing_ms: float = 15.0,
+    tolerance_ms:       float = 5.0,
+    late_weight:        float = 0.0,
 ) -> float:
     """
     컨트롤 스텝 1개(~16ms 윈도우) 기반 중간 보상.
-    compute_reward()와 동일한 이차 패널티, 1/n_steps 스케일링.
-    전체 누적 시 터미널 보상과 유사한 크기 유지.
-
-    안전 지표: HIC15, chest_g (총 2개)
-    제외 지표(compute_reward 참조)는 여기서도 동일하게 미사용.
+    1/n_steps 스케일링으로 터미널 보상과 유사한 크기 유지.
+    방향/타이밍 항도 동일 스케일 적용 (dense feedback).
+    peak_penalty는 에피소드 전체 최대값 필요 → 터미널 보상에서만 계산.
     """
     if not head_acc_g and not torso_acc_g:
         return 0.0
@@ -326,5 +493,20 @@ def compute_step_reward(
 
     if deploy_flags is not None and sum(deploy_flags) == 0:
         r -= _NO_DEPLOY_PEN * scale
+
+    # ── 신규 보상항 (1/n_steps 스케일) ───────────────────────────────────
+    flags = deploy_flags or []
+    if correct_weight or wrong_weight:
+        r += compute_direction_match_bonus(
+            angle, is_rollover, flags, passenger_present, correct_weight, wrong_weight,
+        ) * scale
+    if over_weight:
+        r += compute_over_deploy_penalty(
+            angle, is_rollover, flags, passenger_present, over_weight,
+        ) * scale
+    if late_weight and timing_ms_list:
+        r += compute_late_deploy_penalty(
+            timing_ms_list, flags, baseline_timing_ms, tolerance_ms, late_weight,
+        ) * scale
 
     return float(r)
