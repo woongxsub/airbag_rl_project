@@ -458,26 +458,23 @@ class Human:
             return self._position.copy()
 
     def _resolve_artic_path(self) -> str:
-        """USD 로드 후 실제 articulation root prim 경로를 탐지."""
+        """USD 로드 후 실제 articulation root prim 경로를 탐지 (전체 하위 트리 탐색)."""
         stage = omni.usd.get_context().get_stage()
 
         if stage.GetPrimAtPath(_ARTIC_PATH).IsValid():
             return _ARTIC_PATH
 
-        from pxr import UsdPhysics
+        from pxr import Usd, UsdPhysics
         human_prim = stage.GetPrimAtPath(HUMAN_PRIM_PATH)
         if human_prim.IsValid():
-            for prim in human_prim.GetChildren():
+            # 대체 USD 자산은 계층 깊이가 다를 수 있으므로 2단계 제한 없이 전체 탐색
+            for prim in Usd.PrimRange(human_prim):
                 if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
                     print(f"[Human] articulation root found: {prim.GetPath()}")
                     return str(prim.GetPath())
-            for prim in human_prim.GetChildren():
-                for child in prim.GetChildren():
-                    if child.HasAPI(UsdPhysics.ArticulationRootAPI):
-                        print(f"[Human] articulation root found: {child.GetPath()}")
-                        return str(child.GetPath())
 
-        print(f"[Human] articulation root not found, using default: {_ARTIC_PATH}")
+        print(f"[Human] articulation root not found under {HUMAN_PRIM_PATH}, "
+              f"using default: {_ARTIC_PATH}")
         return _ARTIC_PATH
 
     def _add_seatbelt_visual(self, world, stage):
