@@ -17,9 +17,9 @@ import importlib.util
 import os
 import numpy as np
 import omni.usd
-from isaacsim.core.utils.stage import add_reference_to_stage
-from isaacsim.core.prims import SingleArticulation
-from isaacsim.core.api.objects import VisualCapsule
+from omni.isaac.core.utils.stage import add_reference_to_stage
+from omni.isaac.core.prims import Articulation as SingleArticulation
+from omni.isaac.core.objects import VisualCapsule
 
 # ── prim 경로 ────────────────────────────────────────────────────────────
 HUMAN_PRIM_PATH = "/World/human"
@@ -188,7 +188,7 @@ class Human:
 
         if vehicle_body is not None:
             veh_pos, veh_quat = vehicle_body.get_world_pose()
-            from isaacsim.core.utils.rotations import quat_to_rot_matrix
+            from omni.isaac.core.utils.rotations import quat_to_rot_matrix
             rot = quat_to_rot_matrix(veh_quat)
             veh_pos_arr = np.asarray(veh_pos)
             head_local  = rot.T @ (head_world - veh_pos_arr)

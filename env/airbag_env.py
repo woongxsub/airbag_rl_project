@@ -11,10 +11,10 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
-from isaacsim.core.api import World
-from isaacsim.core.api.objects import FixedCuboid, GroundPlane
+from omni.isaac.core import World
+from omni.isaac.core.objects import FixedCuboid, GroundPlane
 from pxr import UsdPhysics, PhysxSchema, UsdShade, Sdf
-from isaacsim.core.utils.rotations import euler_angles_to_quat
+from omni.isaac.core.utils.rotations import euler_angles_to_quat
 
 from env.vehicle import Vehicle
 from env.human import Human, SEAT_LOCAL

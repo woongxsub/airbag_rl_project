@@ -1,7 +1,7 @@
 import os
 import numpy as np
-from isaacsim.core.utils.stage import add_reference_to_stage
-from isaacsim.core.prims import SingleRigidPrim
+from omni.isaac.core.utils.stage import add_reference_to_stage
+from omni.isaac.core.prims import RigidPrim as SingleRigidPrim
 import omni.usd
 
 VEHICLE_USD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../assets/vehicle.usd")

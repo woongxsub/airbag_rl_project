@@ -12,8 +12,8 @@ prim 경로 /World/vehicle/airbag_<i> → vehicle USD 자식 계층으로 차량
 import numpy as np
 import omni.usd
 from pxr import UsdGeom
-from isaacsim.core.api.objects import VisualSphere
-from isaacsim.core.utils.rotations import quat_to_rot_matrix
+from omni.isaac.core.objects import VisualSphere
+from omni.isaac.core.utils.rotations import quat_to_rot_matrix
 
 AIRBAG_SPECS = {
     0: {"name": "front_driver",    "volume_L": 60,  "k": 1.0,
