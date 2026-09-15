@@ -42,14 +42,55 @@ SITTING_HIP_PITCH_RAD = -1.5708
 SITTING_KNEE_FLEX_RAD =  1.5708
 
 
+_CACHED_HUMANOID_USD_PATH = None
+
+_HUMANOID_USD_SEARCH_ROOTS = [
+    "/isaac-sim",
+    os.environ.get("ISAAC_PATH", ""),
+    os.path.expanduser("~/.local/share/ov/pkg"),
+]
+_HUMANOID_USD_KEYWORDS = ("humanoid", "biped", "newton")
+
+
 def _find_humanoid_usd() -> str:
+    """
+    Newton humanoid USD 자산 경로를 찾는다.
+    1) newton 파이썬 패키지가 설치돼 있으면 그 안의 examples/assets/humanoid.usda 사용
+       (원래 코드 경로 — Isaac Sim 버전과 무관하게 우선 시도).
+    2) newton 패키지가 없으면(Isaac Sim 4.0.0 등) 설치 트리에서 humanoid/biped/newton
+       이름이 들어간 .usd(a|c) 파일을 직접 탐색해 대체 사용.
+    episode마다(reset 시) 호출되므로 탐색 결과는 프로세스 내 캐시.
+    """
+    global _CACHED_HUMANOID_USD_PATH
+    if _CACHED_HUMANOID_USD_PATH is not None:
+        return _CACHED_HUMANOID_USD_PATH
+
     spec = importlib.util.find_spec("newton")
-    if spec is None:
-        raise RuntimeError("Newton 패키지 없음. Isaac Sim 설치 확인 요망.")
-    path = os.path.join(os.path.dirname(spec.origin), "examples", "assets", "humanoid.usda")
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"humanoid.usda 없음: {path}")
-    return path
+    if spec is not None and spec.origin:
+        candidate = os.path.join(os.path.dirname(spec.origin), "examples", "assets", "humanoid.usda")
+        if os.path.exists(candidate):
+            _CACHED_HUMANOID_USD_PATH = candidate
+            return candidate
+
+    searched_roots = [r for r in _HUMANOID_USD_SEARCH_ROOTS if r and os.path.isdir(r)]
+    for root in searched_roots:
+        for dirpath, _, filenames in os.walk(root):
+            for fname in filenames:
+                low = fname.lower()
+                if low.endswith((".usd", ".usda", ".usdc")) and any(k in low for k in _HUMANOID_USD_KEYWORDS):
+                    found = os.path.join(dirpath, fname)
+                    print(f"[human] newton 패키지 없음 — 대체 USD 자산 사용: {found}", flush=True)
+                    _CACHED_HUMANOID_USD_PATH = found
+                    return found
+
+    raise RuntimeError(
+        "humanoid/biped USD 자산을 찾지 못했습니다 "
+        "(newton 패키지 미설치, 설치 트리 대체 탐색도 실패).\n"
+        f"  탐색한 경로: {searched_roots or _HUMANOID_USD_SEARCH_ROOTS}\n"
+        "  다음 명령으로 실제 파일 위치를 확인한 뒤 env/human.py의 "
+        "_HUMANOID_USD_SEARCH_ROOTS에 해당 경로를 추가하세요:\n"
+        "    find /isaac-sim -iname '*.usd*' | grep -iE 'human|newton|biped'"
+    )
 
 
 class Human:
