@@ -18,7 +18,7 @@ import os
 import numpy as np
 import omni.usd
 from omni.isaac.core.utils.stage import add_reference_to_stage
-from omni.isaac.core.prims import Articulation as SingleArticulation
+from omni.isaac.core.articulations import Articulation as SingleArticulation
 from omni.isaac.core.objects import VisualCapsule
 
 # ── prim 경로 ────────────────────────────────────────────────────────────
