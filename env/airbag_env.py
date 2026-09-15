@@ -37,6 +37,10 @@ WALL_DIST_M = 3.5
 WALL_SIZE   = np.array([0.5, 5.0, 3.0])
 WALL_POS_Z  = 1.5
 
+# HIC15가 이 값을 넘으면 물리적으로 불가능한 수치 폭발(NaN 직전 상태)로 간주.
+# 실제 인체 손상 기준(HIC_SAFE=700)과는 무관 — 시뮬레이션 안정성 판단용 임계값.
+EXPLOSION_HIC_THRESHOLD = 1_000_000
+
 # compliant contact (crumple zone 등가 재질)
 _CONTACT_STIFFNESS = 4.5e5  # N/m  — 차량 크럼플존 등가 스프링 강성 (2e5→4.5e5 조정)
 _CONTACT_DAMPING   = 1e5    # N·s/m — 임계감쇠 근처 (바운싱 억제)
@@ -220,6 +224,9 @@ class AirbagEnv(gym.Env):
                 "femur_n":              femur_n,
                 "nij":                  nij,
                 "deploy_count":         int(sum(deploy_flags)),
+                # HIC15가 수치 폭발 임계값을 넘거나 비유한이면 True — 학습
+                # 루프에서 이 에피소드를 buffer에서 제외할지 판단하는 데 사용.
+                "is_explosion":         bool((not np.isfinite(hic15)) or hic15 > EXPLOSION_HIC_THRESHOLD),
             }
 
         obs = self.sampler.to_state_vector(self.scenario)

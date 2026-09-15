@@ -123,6 +123,14 @@ class PPOAgent:
         rewards     = torch.FloatTensor([t["reward"] for t in transitions])
         dones       = torch.FloatTensor([float(t["done"]) for t in transitions])
 
+        # reward Z-score 정규화 — 배치 단위로 mean/std 정규화해서
+        # 극단값(폭발 미만이지만 큰 값)이 GAE/advantage 계산을
+        # 오염시키는 것을 방지
+        r_mean = rewards.mean()
+        r_std  = rewards.std()
+        if r_std > 1e-8:
+            rewards = (rewards - r_mean) / (r_std + 1e-8)
+
         # GAE(λ) advantage 계산
         with torch.no_grad():
             values      = self.critic(states)
