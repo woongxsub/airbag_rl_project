@@ -357,10 +357,11 @@ def run_train(curriculum: bool = False):
         ckpt_chest_g.append(c)
         ckpt_is_explosion.append(float(is_explosion))
 
-        # ── 폭발 에피소드 제외(--exclude-explosions): PPO 버퍼에 넣지 않음 ──
-        if args.exclude_explosions and is_explosion:
+        # ── 폭발 에피소드 집계는 플래그와 무관하게 항상 수행 ──────────────
+        # --exclude-explosions가 있을 때만 PPO 버퍼에서 제외
+        if is_explosion:
             n_explosions += 1
-        else:
+        if not (args.exclude_explosions and is_explosion):
             buffer.extend(ep_transitions)
 
         # ── 100ep 체크포인트 CSV ───────────────────────────────────────────
