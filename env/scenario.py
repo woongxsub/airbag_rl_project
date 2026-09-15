@@ -1,7 +1,7 @@
 """
 시나리오 샘플러 및 State 벡터 인코더.
 
-State 13차원 설계 (실차 센서로 측정 가능한 값만):
+State 11차원 설계 (실차 센서로 측정 가능한 값만):
   [0]  충돌 방향   angle / 360          (외부 레이더/카메라)
   [1]  충돌 속도   speed / 120          (차속 센서)
   [2]  안전벨트    0 or 1               (벨트 버클 센서)
@@ -13,18 +13,18 @@ State 13차원 설계 (실차 센서로 측정 가능한 값만):
   [8]  척추 기울기  (spine_tilt_deg + 15) / 35  (cabin ToF 카메라)
   [9]  머리-스티어링 거리  head_to_steering / 1.0  (cabin ToF 카메라)
   [10] 무릎-대시보드 거리  knee_to_dashboard / 0.5 (cabin ToF 카메라)
-  [11] 전복 여부   is_rollover   0 or 1  (rollover sensor — 자이로/각속도)
-  [12] 동승자 점유  passenger_present 0 or 1  (OCS 시트 센서)
 
 [4]~[10] 은 에피소드 리셋 시 airbag_env 가 measure_snapshot() 으로 측정하여
 scenario dict 에 추가한다. 값이 없으면 신장 기반 추정치로 대체.
 충돌 강성(stiffness)은 실차에서 사전 측정 불가 → 제외.
+is_rollover / passenger_present 는 sample() 내부에서 유지되지만
+State에는 포함하지 않음 — rule_based_policy() 인자로만 사용.
 """
 
 import numpy as np
 
 # State 차원 (ppo.py / train.py 와 동기화)
-STATE_DIM = 13
+STATE_DIM = 11
 
 # 착좌 자세 척추 기울기 샘플 범위 (도)
 SPINE_TILT_MIN_DEG = -10.0
@@ -32,27 +32,65 @@ SPINE_TILT_MAX_DEG =  20.0
 
 
 class ScenarioSampler:
+    """
+    충돌 시나리오 샘플러.
+
+    stage 속성으로 커리큘럼 단계 제어 (외부에서 직접 변경):
+      0 = Pure PPO — 전 범위 (기본값)
+      1 = Stage 1  — 정면±45°, 30-60 km/h, 전복 없음   (관대)
+      2 = Stage 2  — 전 각도,   30-90 km/h, 전복 5%    (중간, 누적 확장)
+      3 = Stage 3  — 전 각도,  20-120 km/h, 전복 15%   (전 범위, 누적 확장)
+      4 = Stage 4  — 전 각도,  20-120 km/h, 전복 15%   (Stage 3 동일, 보상 가중치만 다름)
+
+    각도는 Stage 1(정면±45°)→ Stage 2/3/4(전 범위) 이분법적 확장.
+    속도는 누적 확장형 (이전 범위 포함하며 상한 확대).
+    """
+
     def __init__(self, seed=None):
-        self.rng = np.random.default_rng(seed)
+        self.rng   = np.random.default_rng(seed)
+        self.stage = 0  # 외부(train.py 루프)에서 에피소드마다 갱신
 
     def sample(self) -> dict:
         """충돌 시나리오 + 체형 파라미터 샘플링."""
+        s = self.stage
+
+        # ── 충돌 각도 ────────────────────────────────────────────────────
+        if s == 1:
+            # 정면 충돌: 315~360° 또는 0~45° (각 50% 확률)
+            if self.rng.random() < 0.5:
+                angle = float(self.rng.uniform(315.0, 360.0))
+            else:
+                angle = float(self.rng.uniform(0.0, 45.0))
+        else:
+            angle = float(self.rng.uniform(0.0, 360.0))
+
+        # ── 충돌 속도 (누적 확장형) ──────────────────────────────────────
+        if s == 1:
+            speed = float(self.rng.uniform(30.0, 60.0))
+        elif s == 2:
+            speed = float(self.rng.uniform(30.0, 90.0))   # Stage 1 범위 포함
+        else:
+            speed = float(self.rng.uniform(20.0, 120.0))  # 전 범위 (Stage 3 & Pure)
+
+        # ── 전복 확률 ────────────────────────────────────────────────────
+        # 실차 rollover sensor(자이로/각속도계)에 대응.
+        rollover_prob = {0: 0.05, 1: 0.00, 2: 0.05, 3: 0.15, 4: 0.15}.get(s, 0.05)
+
         return {
-            "angle":             float(self.rng.uniform(0, 360)),
-            "speed":             float(self.rng.uniform(20, 120)),
+            "angle":             angle,
+            "speed":             speed,
             "seatbelt":          bool(self.rng.integers(0, 2)),
             "height":            float(self.rng.uniform(1.55, 1.90)),
             "weight":            float(self.rng.uniform(50.0, 100.0)),
-            # 전복: 실차 rollover sensor(자이로/각속도계)에 대응. 약 5% 확률로 발생.
-            "is_rollover":       bool(self.rng.random() < 0.05),
-            # 동승자 점유: OCS(Occupant Classification System) 시트 센서에 대응.
+            "is_rollover":       bool(self.rng.random() < rollover_prob),
+            # OCS(Occupant Classification System) 시트 센서에 대응.
             "passenger_present": bool(self.rng.integers(0, 2)),
         }
 
     def to_state_vector(self, scenario: dict) -> np.ndarray:
         """
-        scenario dict → 12차원 정규화 벡터 [0, 1].
-        measure_snapshot 결과([5]~[11])가 없으면 신장 기반 추정치 사용.
+        scenario dict → 11차원 정규화 벡터 [0, 1].
+        measure_snapshot 결과([4]~[10])가 없으면 신장 기반 추정치 사용.
         """
         height = scenario["height"]
 
@@ -78,6 +116,4 @@ class ScenarioSampler:
             np.clip((spine_tilt_deg + 15.0) / 35.0, 0.0, 1.0),
             np.clip(head_to_steering  / 1.0, 0.0, 1.0),
             np.clip(knee_to_dashboard / 0.5, 0.0, 1.0),
-            float(scenario.get("is_rollover",       False)),  # [11] rollover sensor
-            float(scenario.get("passenger_present", True)),   # [12] OCS 시트 센서
         ], dtype=np.float32)

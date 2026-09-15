@@ -67,6 +67,10 @@ class Human:
         self._thigh_idx:   int  = 0
         self._dof_name_to_idx: dict = {}
 
+        # 안전벨트 스프링 기준 상태 (reset_belt_reference()로 갱신)
+        self._belt_ref_torso: np.ndarray | None = None
+        self._belt_veh_int:   np.ndarray        = np.zeros(3, dtype=np.float32)
+
         stage = omni.usd.get_context().get_stage()
         if not stage.GetPrimAtPath(HUMAN_PRIM_PATH).IsValid():
             add_reference_to_stage(usd_path=_find_humanoid_usd(), prim_path=HUMAN_PRIM_PATH)
@@ -219,26 +223,55 @@ class Human:
 
     # ── 안전벨트 ─────────────────────────────────────────────────────────
     # FMVSS 209 / ECE R16 현업 스펙:
-    #   k_belt  = 8,000 N/(m/s)  — 벨트 강성·감쇠 계수
-    #   F_cap   = 15,000 N       — 로드 리미터 (프리텐셔너 포함 최대 하중)
-    _K_BELT = 8_000.0
-    _F_BELT_CAP = 15_000.0
+    #   k_spring = 50,000 N/m   — 변위 스프링 (위치 구속)
+    #   k_damp   = 8,000 N·s/m  — 속도 감쇠
+    #   F_cap    = 15,000 N     — 로드 리미터 (프리텐셔너 포함 최대 하중)
+    _K_BELT        = 8_000.0
+    _K_BELT_SPRING = 50_000.0
+    _F_BELT_CAP    = 15_000.0
 
-    def apply_seatbelt(self, wearing: bool, vehicle_body=None):
+    def reset_belt_reference(self):
+        """에피소드 reset 시 안전벨트 기준위치 초기화."""
+        self._belt_ref_torso: np.ndarray | None = None
+        self._belt_veh_int:   np.ndarray        = np.zeros(3, dtype=np.float32)
+
+    def apply_seatbelt(self, wearing: bool, vehicle_body=None, step_dt: float = 0.001):
         if not wearing or self.articulation is None:
             return
         torso_vel = self.get_torso_velocity()
+        torso_pos = self.get_torso_position()
+
+        veh_vel = np.zeros(3, dtype=np.float32)
         if vehicle_body is not None:
             try:
-                veh_vel = np.asarray(vehicle_body.get_linear_velocity())
-                rel_vel = torso_vel - veh_vel
+                v = vehicle_body.get_linear_velocity()
+                if v is not None:
+                    veh_vel = np.asarray(v, dtype=np.float32)
             except Exception:
-                rel_vel = torso_vel
-        else:
-            rel_vel = torso_vel
+                pass
 
-        raw_force = -rel_vel * self._K_BELT
-        # 로드 리미터: 절댓값 캡
+        rel_vel = torso_vel - veh_vel
+
+        # NaN 가드
+        if not (np.all(np.isfinite(rel_vel)) and np.all(np.isfinite(torso_pos))):
+            return
+
+        # 차량 속도 적분으로 차량 변위 추적
+        # (get_world_pose는 physics callback에서 실패하므로 속도 적분 우회)
+        if np.all(np.isfinite(veh_vel)):
+            self._belt_veh_int += veh_vel * step_dt
+
+        # 기준 위치 지연 초기화 (첫 유효 호출 시)
+        if self._belt_ref_torso is None:
+            self._belt_ref_torso = (torso_pos - self._belt_veh_int).astype(np.float32)
+
+        # 차량 기준 torso 상대 변위 (에피소드 시작점 대비)
+        rel_disp = (torso_pos - self._belt_veh_int) - self._belt_ref_torso
+
+        # 스프링(위치) + 감쇠(속도) 합산
+        raw_force = -self._K_BELT_SPRING * rel_disp - self._K_BELT * rel_vel
+
+        # 로드 리미터
         norm = float(np.linalg.norm(raw_force))
         if norm > self._F_BELT_CAP:
             raw_force = raw_force * (self._F_BELT_CAP / norm)
@@ -339,15 +372,30 @@ class Human:
             return None
 
     def _apply_link_force(self, link_idx: int, force: np.ndarray):
-        """physics_view 로 특정 링크에 힘을 인가."""
+        """physics_view 로 특정 링크에 순수 힘(토크 없음)을 인가.
+
+        pos=zeros 를 쓰면 레버암 = link_world_pos - [0,0,0] 가 되어
+        거대한 토크(수만 N·m)가 발생해 articulation이 폭발한다.
+        적용점을 링크 월드 좌표로 설정하면 레버암=0 → 토크=0.
+        """
         if self._physics_view is None:
             return
         try:
-            n_links = self._physics_view.max_links
-            forces  = np.zeros((1, n_links, 3), dtype=np.float32)
-            torques = np.zeros((1, n_links, 3), dtype=np.float32)
-            pos     = np.zeros((1, n_links, 3), dtype=np.float32)
+            n_links    = self._physics_view.max_links
+            forces     = np.zeros((1, n_links, 3), dtype=np.float32)
+            torques    = np.zeros((1, n_links, 3), dtype=np.float32)
+            pos        = np.zeros((1, n_links, 3), dtype=np.float32)
             forces[0, link_idx] = force
+
+            # 적용점 = 링크 월드 좌표 → 레버암 0, 토크 0
+            transforms = self._get_link_transforms()
+            if transforms is not None:
+                link_pos = np.asarray(transforms[0, link_idx, :3], dtype=np.float32)
+                if np.all(np.isfinite(link_pos)):
+                    pos[0, link_idx] = link_pos
+                else:
+                    return  # 변환 유효하지 않음 → 힘 인가 건너뜀
+
             indices = np.array([0], dtype=np.int32)
             self._physics_view.apply_forces_and_torques_at_position(
                 forces, torques, pos, indices, True

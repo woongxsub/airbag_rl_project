@@ -1,6 +1,6 @@
 env:
   headless: true
-  state_dim: 13              # 시나리오(3) + 체형(2) + 자세(4) + 유격거리(2) + rollover(1) + OCS(1)
+  state_dim: 11              # 충돌방향/속도/벨트(3) + 체형(2) + 자세·거리(6)
   episode_steps: 60          # RL action 주기 횟수 (control_dt 기준)
   physics_dt: 0.001          # 물리 연산 주기 1ms — HIC15 슬라이딩 윈도우 정밀도
   control_dt: 0.016667       # RL action/observation 주기 1/60초

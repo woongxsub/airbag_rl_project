@@ -36,7 +36,14 @@ AIRBAG_LOCAL_POSITIONS = {
     4: np.array([0.10,  0.65, 1.50]),
 }
 
-PRESSURE_OPT = 300.0
+# 출처 1: ResearchGate, "Airbag pressures for the different simulation conditions"
+#   https://www.researchgate.net/figure/Airbag-pressures-for-the-different-simulation-conditions_fig2_361562872
+#   인용: "In the 69 km/h crash, peak in-crash airbag pressures of 47-53 kPa were measured"
+# 출처 2: US Patent 9623831, "Three-chamber frontal impact airbag with controlled pressure differentials"
+#   https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/9623831
+#   인용: "the gas pressure of the center chamber is approximately 80 to approximately 250 kPa"
+# → 실측 범위 0~250 kPa의 중간값(이론적 감쇠 최적점)으로 설정
+PRESSURE_OPT = 130.0
 DAMPING_BASE = 0.75
 INFLATE_MS   = 50.0
 BASE_FORCE   = 500.0
@@ -70,6 +77,11 @@ class AirbagSystem:
         self._sphere_prims   = {}
         self._inflate_start  = {}
         self._fully_inflated = set()
+
+        # 차량 world pose (reset()에서 초기화, callback에서 속도 적분)
+        self._veh_init_pos: np.ndarray = np.zeros(3, dtype=np.float32)
+        self._veh_init_rot: np.ndarray = np.eye(3, dtype=np.float32)
+        self._veh_int_pos:  np.ndarray = np.zeros(3, dtype=np.float32)
 
         stage = omni.usd.get_context().get_stage()
 
@@ -113,18 +125,22 @@ class AirbagSystem:
             if inflate_ratio >= 1.0:
                 self._fully_inflated.add(i)
 
-    def apply_forces(self, actions: np.ndarray, collision_angle: float, current_ms: float):
+    def apply_forces(self, actions: np.ndarray, collision_angle: float,
+                     current_ms: float, step_dt: float = 0.001):
         """Physics callback (1000Hz): 감쇠력 인가만. USD 업데이트 없음."""
-        # 차량 world pose 취득 — 에어백 local→world 변환 (1ms마다 1회)
-        rot        = None
-        veh_origin = None
+        # 차량 속도 적분으로 에어백 월드 위치 추적.
+        # get_world_pose()는 physics callback에서 실패하므로 속도 적분으로 우회.
         if self.vehicle is not None:
             try:
-                veh_pos, veh_quat = self.vehicle.body.get_world_pose()
-                rot        = quat_to_rot_matrix(np.asarray(veh_quat))
-                veh_origin = np.asarray(veh_pos)
+                veh_vel = np.asarray(self.vehicle.body.get_linear_velocity(),
+                                     dtype=np.float32)
+                if np.all(np.isfinite(veh_vel)):
+                    self._veh_int_pos += veh_vel * step_dt
             except Exception:
                 pass
+
+        rot        = self._veh_init_rot
+        veh_origin = self._veh_init_pos + self._veh_int_pos
 
         for i, spec in AIRBAG_SPECS.items():
             deploy    = actions[i, 0] > 0.5
@@ -143,10 +159,8 @@ class AirbagSystem:
 
             damping = spec["k"] * _reverse_u_curve(pressure) * inflate_ratio
 
-            # 에어백 월드 좌표 (vehicle=None이면 게이트 비활성 — 폴백)
-            airbag_world = None
-            if rot is not None:
-                airbag_world = veh_origin + rot @ AIRBAG_LOCAL_POSITIONS[i]
+            # 에어백 월드 좌표 (초기 pose + 속도 적분)
+            airbag_world = veh_origin + rot @ AIRBAG_LOCAL_POSITIONS[i]
 
             self._apply_damping(i, damping, spec, airbag_world, inflate_ratio)
 
@@ -155,6 +169,19 @@ class AirbagSystem:
         self._fully_inflated.clear()
         for i in self._sphere_prims:
             self._set_radius(i, 0.001)
+
+        # 에피소드 초기 차량 pose 기록 (callback 밖이므로 get_world_pose 사용 가능)
+        self._veh_int_pos = np.zeros(3, dtype=np.float32)
+        if self.vehicle is not None:
+            try:
+                veh_pos, veh_quat = self.vehicle.body.get_world_pose()
+                self._veh_init_pos = np.asarray(veh_pos, dtype=np.float32)
+                self._veh_init_rot = quat_to_rot_matrix(
+                    np.asarray(veh_quat)
+                ).astype(np.float32)
+            except Exception:
+                self._veh_init_pos = np.zeros(3, dtype=np.float32)
+                self._veh_init_rot = np.eye(3, dtype=np.float32)
 
     def _set_radius(self, idx: int, radius: float):
         self._sphere_prims[idx].GetRadiusAttr().Set(max(float(radius), 0.001))
@@ -196,6 +223,10 @@ class AirbagSystem:
                 link_idx = human._torso_idx
                 body_pos = human.get_torso_position()
             else:
+                continue
+
+            # NaN 가드: 초기화 직후 physics_view 값이 유효하지 않을 때
+            if not np.all(np.isfinite(vel)):
                 continue
 
             # ── 거리 기반 게이트 ─────────────────────────────────────────

@@ -3,7 +3,7 @@
 
 물리 충돌 모델: rigid wall + compliant contact material
   차량 전면에 crumple zone 등가 재질 적용
-  stiffness=2e5 N/m, damping=1e5 N·s/m
+  stiffness=4.5e5 N/m, damping=1e5 N·s/m
   → 1ms 스텝 내 충격력 유한화, NaN 폭발 방지
 """
 
@@ -48,12 +48,14 @@ _CONTACT_DAMPING   = 1e5    # N·s/m — 임계감쇠 근처 (바운싱 억제)
 
 class AirbagEnv(gym.Env):
     """
-    State  : 11차원 (실차 센서 측정 가능한 값만)
+    State  : 11차원 (실차 센서 측정 가능한 값만, scenario.STATE_DIM=11)
     Action : 15차원 (에어백 5개 × [deploy, timing, pressure])
     Reward : Dense (스텝마다) + Terminal (에피소드 종료 시 bonus/penalty)
+             안전 지표 5개: HIC15, Nij, chest_g, chest_3ms, chest_compression_mm
     """
 
-    def __init__(self, headless: bool = True, debug: bool = False):
+    def __init__(self, headless: bool = True, debug: bool = False,
+                 violation_coeff: float = 5.0):
         super().__init__()
         self.world = World(
             physics_dt=PHYSICS_DT,
@@ -64,7 +66,7 @@ class AirbagEnv(gym.Env):
         self.sampler          = ScenarioSampler()
         self._rng             = np.random.default_rng()
         self.scenario         = None
-        self.collector        = InjuryDataCollector(human=None, physics_dt=PHYSICS_DT)
+        self.collector        = InjuryDataCollector(human=None, vehicle_body=None, physics_dt=PHYSICS_DT)
         self._wall            = None
         self.last_raw_actions = None
 
@@ -72,13 +74,34 @@ class AirbagEnv(gym.Env):
         self._cb_seatbelt = False
         self._physics_ms  = 0.0
 
-        self.debug = debug
+        self.debug           = debug
+        self.violation_coeff = violation_coeff  # 커리큘럼 단계에서 외부 갱신 가능
+
+        # 하이브리드 커리큘럼 보상 가중치 (외부에서 에피소드마다 갱신)
+        self.correct_weight   = 0.0
+        self.wrong_weight     = 0.0
+        self.over_weight      = 0.0
+        self.late_weight      = 0.0
+        self.peak_weight      = 0.0
+
+        # 에피소드 내 최대 가속도 추적 (peak_penalty용)
+        self.max_head_acc_g   = 0.0
+        self.max_torso_acc_g  = 0.0
+
         self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(STATE_DIM,), dtype=np.float32)
         self.action_space      = spaces.Box(low=0.0, high=1.0, shape=(15,), dtype=np.float32)
 
     # ── reset ──────────────────────────────────────────────────────────
 
     def reset(self, seed=None, options=None):
+        # 이전 에피소드 콜백을 world.reset() 이전에 먼저 제거
+        # → world.reset() 내부 물리 스텝에서 구 콜백이 실행되는 것을 차단 (addTorque NaN 방지)
+        for cb in ("collect_injury", "apply_forces"):
+            try:
+                self.world.remove_physics_callback(cb)
+            except Exception:
+                pass
+
         self.world.reset()
         self.scenario = self.sampler.sample()
 
@@ -130,26 +153,23 @@ class AirbagEnv(gym.Env):
         self.vehicle.body.set_linear_velocity(init_vel)
         self.human.set_initial_velocity(init_vel)
 
-        self.collector.human = self.human
+        self.collector.human        = self.human
+        self.collector.vehicle_body = self.vehicle.body  # chest_compression 상대 변위 계산용
         self.collector.reset()
-        try:
-            self.world.remove_physics_callback("collect_injury")
-        except Exception:
-            pass
         self.world.add_physics_callback("collect_injury", self.collector.physics_callback)
+
+        self.human.reset_belt_reference()  # 안전벨트 스프링 기준위치 초기화
 
         self._cb_actions  = np.zeros((5, 3), dtype=np.float32)
         self._cb_seatbelt = bool(self.scenario["seatbelt"])
         self._physics_ms  = 0.0
 
-        try:
-            self.world.remove_physics_callback("apply_forces")
-        except Exception:
-            pass
         self.world.add_physics_callback("apply_forces", self._force_physics_callback)
 
         self._step              = 0
         self._prev_sample_count = 0
+        self.max_head_acc_g     = 0.0
+        self.max_torso_acc_g    = 0.0
 
         obs = self.sampler.to_state_vector(self.scenario)
         return obs, {}
@@ -175,6 +195,14 @@ class AirbagEnv(gym.Env):
         curr_count = len(self.collector.head_acc_g)
         self._prev_sample_count = curr_count
 
+        # 에피소드 최대 가속도 추적 (peak_penalty용)
+        _head_win  = self.collector.head_acc_g[prev_count:curr_count]
+        _torso_win = self.collector.torso_acc_g[prev_count:curr_count]
+        if _head_win:
+            self.max_head_acc_g  = max(self.max_head_acc_g,  max(_head_win))
+        if _torso_win:
+            self.max_torso_acc_g = max(self.max_torso_acc_g, max(_torso_win))
+
         if self.debug:
             print(
                 f"[step {self._step:02d}] "
@@ -184,18 +212,25 @@ class AirbagEnv(gym.Env):
                 flush=True,
             )
 
-        deploy_flags = [raw_actions[i, 0] > 0.5 for i in range(5)]
+        deploy_flags   = [raw_actions[i, 0] > 0.5 for i in range(5)]
+        timing_ms_list = [float(raw_actions[i, 1]) for i in range(5)]   # _parse_action에서 이미 ms 단위
 
         # Dense reward: 이번 스텝 윈도우 (~17ms)
         reward = compute_step_reward(
-            head_acc_g   = self.collector.head_acc_g[prev_count:curr_count],
-            head_acc_3d  = self.collector.head_acc_3d[prev_count:curr_count],
-            torso_acc_g  = self.collector.torso_acc_g[prev_count:curr_count],
-            thigh_acc_3d = self.collector.thigh_acc_3d[prev_count:curr_count],
-            torso_pos    = self.collector.torso_pos_history[prev_count:curr_count],
-            dt           = PHYSICS_DT,
-            deploy_flags = deploy_flags,
-            n_steps      = COLLISION_STEPS,
+            head_acc_g        = self.collector.head_acc_g[prev_count:curr_count],
+            torso_acc_g       = self.collector.torso_acc_g[prev_count:curr_count],
+            dt                = PHYSICS_DT,
+            deploy_flags      = deploy_flags,
+            n_steps           = COLLISION_STEPS,
+            violation_coeff   = self.violation_coeff,
+            angle             = float(self.scenario.get("angle", 0.0)),
+            is_rollover       = bool(self.scenario.get("is_rollover", False)),
+            passenger_present = bool(self.scenario.get("passenger_present", True)),
+            correct_weight    = self.correct_weight,
+            wrong_weight      = self.wrong_weight,
+            over_weight       = self.over_weight,
+            timing_ms_list    = timing_ms_list,
+            late_weight       = self.late_weight,
         )
 
         done = self._step >= COLLISION_STEPS
@@ -206,14 +241,27 @@ class AirbagEnv(gym.Env):
             hic15       = compute_hic15(self.collector.head_acc_g, dt)
             chest_g     = compute_chest_g(self.collector.torso_acc_g)
             chest_3ms   = compute_chest_3ms_clip(self.collector.torso_acc_g, dt)
-            compression = compute_chest_compression_mm(self.collector.torso_pos_history)
+            compression = compute_chest_compression_mm(
+                self.collector.torso_pos_history,
+            )
             femur_n     = compute_femur_force_n(self.collector.thigh_acc_3d)
             nij         = compute_nij(self.collector.head_acc_3d)
 
             terminal_reward = compute_reward(
-                hic15=hic15, chest_g=chest_g, chest_3ms=chest_3ms,
-                chest_compression_mm=compression, femur_n=femur_n,
-                nij=nij, deploy_flags=deploy_flags,
+                hic15=hic15, chest_g=chest_g,
+                deploy_flags      = deploy_flags,
+                violation_coeff   = self.violation_coeff,
+                angle             = float(self.scenario.get("angle", 0.0)),
+                is_rollover       = bool(self.scenario.get("is_rollover", False)),
+                passenger_present = bool(self.scenario.get("passenger_present", True)),
+                correct_weight    = self.correct_weight,
+                wrong_weight      = self.wrong_weight,
+                over_weight       = self.over_weight,
+                timing_ms_list    = timing_ms_list,
+                late_weight       = self.late_weight,
+                max_head_acc_g    = self.max_head_acc_g,
+                max_torso_acc_g   = self.max_torso_acc_g,
+                peak_weight       = self.peak_weight,
             )
             reward += terminal_reward
             info = {
@@ -335,12 +383,14 @@ class AirbagEnv(gym.Env):
         self._physics_ms += step_size * 1000.0
         if self.human is None:
             return
-        self.human.apply_seatbelt(self._cb_seatbelt, self.vehicle.body)
+        self.human.apply_seatbelt(self._cb_seatbelt, self.vehicle.body,
+                                   step_dt=step_size)
         if self.airbag_sys is not None and self.scenario is not None:
             self.airbag_sys.apply_forces(
                 self._cb_actions,
                 self.scenario["angle"],
                 self._physics_ms,
+                step_dt=step_size,
             )
 
     # ── 내부 ───────────────────────────────────────────────────────────
@@ -369,11 +419,13 @@ class AirbagEnv(gym.Env):
             self._wall.set_world_pose(position=wall_pos, orientation=wall_quat)
 
     def _parse_action(self, action: np.ndarray) -> np.ndarray:
+        # 압력 Action 범위: 0~1 → 0~250 kPa (실측 기반 현실화)
+        # 출처: US Patent 9623831 (80~250 kPa), ResearchGate 충돌 실험 (47~53 kPa)
         result = np.zeros((5, 3), dtype=np.float32)
         for i in range(5):
             deploy = float(action[i] > 0.5)
             result[i, 0] = deploy
             if deploy:
                 result[i, 1] = action[5  + i] * TIMING_MAX_MS
-                result[i, 2] = action[10 + i] * 600.0
+                result[i, 2] = action[10 + i] * 250.0
         return result
