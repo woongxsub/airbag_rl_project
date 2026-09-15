@@ -51,14 +51,42 @@ _HUMANOID_USD_SEARCH_ROOTS = [
 ]
 _HUMANOID_USD_KEYWORDS = ("humanoid", "biped", "newton")
 
+# Isaac Sim 4.0.0 기본 설치에 들어있는 PhysX 표준 휴머노이드 랙돌 자산.
+# torso/head/pelvis/*_thigh 링크 + right_hip_y·abdomen_y·*_knee 등 DOF 이름이
+# 본 파일의 힌트 테이블(_HIP_PITCH_HINTS 등)과 정확히 일치하는 유일한 대체 자산이다.
+# (검증됨: 관절 21개, articulation root = <prim>/torso)
+_KNOWN_GOOD_USD_PATHS = [
+    "/isaac-sim/extsPhysics/omni.physics.tensors.tests/data/usd/Humanoid.usda",
+]
+
+
+def _is_valid_articulated_humanoid(path: str) -> bool:
+    """후보 USD가 실제 물리 관절(PhysicsArticulationRootAPI)을 포함하는지 검증.
+
+    biped_tpose.usd 같은 애니메이션 리타겟팅용 스켈레톤 메시는 파일명에
+    'biped'가 들어있어 키워드 매칭에는 걸리지만 물리 조인트가 전혀 없어
+    articulation 생성이 실패하고(따라서 인체가 물리적으로 전혀 반응하지 않아
+    HIC/chest g 등 부상 지표가 항상 0으로 나옴) 걸러내야 한다.
+    """
+    try:
+        from pxr import Usd, UsdPhysics
+        stage = Usd.Stage.Open(path)
+        if stage is None:
+            return False
+        return any(prim.HasAPI(UsdPhysics.ArticulationRootAPI) for prim in stage.Traverse())
+    except Exception:
+        return False
+
 
 def _find_humanoid_usd() -> str:
     """
     Newton humanoid USD 자산 경로를 찾는다.
     1) newton 파이썬 패키지가 설치돼 있으면 그 안의 examples/assets/humanoid.usda 사용
        (원래 코드 경로 — Isaac Sim 버전과 무관하게 우선 시도).
-    2) newton 패키지가 없으면(Isaac Sim 4.0.0 등) 설치 트리에서 humanoid/biped/newton
-       이름이 들어간 .usd(a|c) 파일을 직접 탐색해 대체 사용.
+    2) 없으면 알려진 정상 동작 자산 경로(_KNOWN_GOOD_USD_PATHS)를 우선 시도.
+    3) 그래도 없으면(Isaac Sim 4.0.0 등) 설치 트리에서 humanoid/biped/newton
+       이름이 들어간 .usd(a|c) 파일을 탐색하되, 실제 PhysicsArticulationRootAPI를
+       가진(=관절이 있는) 파일만 후보로 채택한다.
     episode마다(reset 시) 호출되므로 탐색 결과는 프로세스 내 캐시.
     """
     global _CACHED_HUMANOID_USD_PATH
@@ -72,23 +100,33 @@ def _find_humanoid_usd() -> str:
             _CACHED_HUMANOID_USD_PATH = candidate
             return candidate
 
+    for candidate in _KNOWN_GOOD_USD_PATHS:
+        if os.path.exists(candidate) and _is_valid_articulated_humanoid(candidate):
+            print(f"[human] newton 패키지 없음 — 검증된 대체 USD 자산 사용: {candidate}", flush=True)
+            _CACHED_HUMANOID_USD_PATH = candidate
+            return candidate
+
     searched_roots = [r for r in _HUMANOID_USD_SEARCH_ROOTS if r and os.path.isdir(r)]
     for root in searched_roots:
-        for dirpath, _, filenames in os.walk(root):
-            for fname in filenames:
+        for dirpath, _, filenames in sorted(os.walk(root)):
+            for fname in sorted(filenames):
                 low = fname.lower()
-                if low.endswith((".usd", ".usda", ".usdc")) and any(k in low for k in _HUMANOID_USD_KEYWORDS):
-                    found = os.path.join(dirpath, fname)
-                    print(f"[human] newton 패키지 없음 — 대체 USD 자산 사용: {found}", flush=True)
-                    _CACHED_HUMANOID_USD_PATH = found
-                    return found
+                if not (low.endswith((".usd", ".usda", ".usdc")) and any(k in low for k in _HUMANOID_USD_KEYWORDS)):
+                    continue
+                found = os.path.join(dirpath, fname)
+                if not _is_valid_articulated_humanoid(found):
+                    print(f"[human] 후보 제외(관절 없음): {found}", flush=True)
+                    continue
+                print(f"[human] newton 패키지 없음 — 검증된 대체 USD 자산 사용: {found}", flush=True)
+                _CACHED_HUMANOID_USD_PATH = found
+                return found
 
     raise RuntimeError(
-        "humanoid/biped USD 자산을 찾지 못했습니다 "
+        "관절이 있는 humanoid/biped USD 자산을 찾지 못했습니다 "
         "(newton 패키지 미설치, 설치 트리 대체 탐색도 실패).\n"
         f"  탐색한 경로: {searched_roots or _HUMANOID_USD_SEARCH_ROOTS}\n"
         "  다음 명령으로 실제 파일 위치를 확인한 뒤 env/human.py의 "
-        "_HUMANOID_USD_SEARCH_ROOTS에 해당 경로를 추가하세요:\n"
+        "_KNOWN_GOOD_USD_PATHS 또는 _HUMANOID_USD_SEARCH_ROOTS에 해당 경로를 추가하세요:\n"
         "    find /isaac-sim -iname '*.usd*' | grep -iE 'human|newton|biped'"
     )
 
