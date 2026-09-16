@@ -26,7 +26,8 @@ parser.add_argument("--seed",     type=int, default=None,
 parser.add_argument("--label",    type=str, default=None,
                     help="출력 파일 접두사 (기본: pure/curriculum/rulebased/hybrid_3k)")
 parser.add_argument("--exclude-explosions", action="store_true",
-                    help="물리 폭발(HIC15>=1M) 에피소드의 transition을 PPO 버퍼에서 제외 (run_train 전용)")
+                    help="물리 폭발(env.airbag_env.EXPLOSION_HIC_THRESHOLD 초과) 에피소드의 "
+                         "transition을 PPO 버퍼에서 제외 (run_train 전용)")
 args = parser.parse_args()
 
 if args.stream or args.gui:
@@ -116,26 +117,22 @@ def get_hybrid_stage(ep: int, total: int) -> dict:
 
 # ── 체크포인트 CSV ────────────────────────────────────────────────────────────
 
-def _write_checkpoint_csv(path: str, episode: int, hic15_buf: list, chest_g_buf: list,
+def _write_checkpoint_csv(path: str, episode: int, hic15_buf: list,
                            explosion_buf: list = None):
     """100ep 윈도우 통계를 CSV에 한 줄 추가.
 
     explosion_buf가 주어지면(run_train 전용) 윈도우 내 폭발 에피소드 비율을
     "is_explosion" 컬럼으로 추가 기록한다.
     """
-    hic_arr   = np.array(hic15_buf,   dtype=float)
-    chest_arr = np.array(chest_g_buf, dtype=float)
-    hic_f     = hic_arr[np.isfinite(hic_arr)   & (hic_arr   > 0)]
-    chest_f   = chest_arr[np.isfinite(chest_arr) & (chest_arr > 0)]
-    hic_safe  = hic_f[hic_f < 1_000_000]   # 물리 폭발 제외 (HIC15 < 1M)
+    hic_arr  = np.array(hic15_buf, dtype=float)
+    hic_f    = hic_arr[np.isfinite(hic_arr) & (hic_arr > 0)]
+    hic_safe = hic_f[hic_f < 1_000_000]   # 물리 폭발 제외 (HIC15 < 1M)
 
     row = {
         "episode":                     episode,
-        "hic15_median":                float(np.median(hic_f))     if len(hic_f)    else float("nan"),
-        "chest_g_median":              float(np.median(chest_f))   if len(chest_f)  else float("nan"),
-        "hic15_mean":                  float(np.mean(hic_f))       if len(hic_f)    else float("nan"),
-        "chest_g_mean":                float(np.mean(chest_f))     if len(chest_f)  else float("nan"),
-        "hic15_median_excl_explosion": float(np.median(hic_safe))  if len(hic_safe) else float("nan"),
+        "hic15_median":                float(np.median(hic_f))    if len(hic_f)    else float("nan"),
+        "hic15_mean":                  float(np.mean(hic_f))      if len(hic_f)    else float("nan"),
+        "hic15_median_excl_explosion": float(np.median(hic_safe)) if len(hic_safe) else float("nan"),
     }
     if explosion_buf is not None:
         row["is_explosion"] = float(np.mean(explosion_buf)) if explosion_buf else float("nan")
@@ -170,11 +167,9 @@ def run_rulebased():
         env.sampler = ScenarioSampler(seed=seed)
     env.sampler.stage = 0   # Pure distribution (full range)
 
-    all_hic15    = []
-    all_chest_g  = []
-    ckpt_hic15   = []
-    ckpt_chest_g = []
-    wall_start   = time.time()
+    all_hic15  = []
+    ckpt_hic15 = []
+    wall_start = time.time()
 
     for ep in range(1, N + 1):
         obs, _ = env.reset()
@@ -195,17 +190,13 @@ def run_rulebased():
             if info:
                 ep_info = info
 
-        h = ep_info.get("hic15",   float("nan"))
-        c = ep_info.get("chest_g", float("nan"))
+        h = ep_info.get("hic15", float("nan"))
         all_hic15.append(h)
-        all_chest_g.append(c)
         ckpt_hic15.append(h)
-        ckpt_chest_g.append(c)
 
         if ep % 100 == 0:
-            _write_checkpoint_csv(csv_path, ep, ckpt_hic15, ckpt_chest_g)
+            _write_checkpoint_csv(csv_path, ep, ckpt_hic15)
             ckpt_hic15.clear()
-            ckpt_chest_g.clear()
             h_arr = np.array(all_hic15)
             h_f   = h_arr[np.isfinite(h_arr) & (h_arr > 0)]
             elapsed = time.time() - wall_start
@@ -217,8 +208,7 @@ def run_rulebased():
             )
 
     env.close()
-    np.save(f"results/logs/{label}_hic15.npy",   all_hic15)
-    np.save(f"results/logs/{label}_chest_g.npy", all_chest_g)
+    np.save(f"results/logs/{label}_hic15.npy", all_hic15)
 
     elapsed = time.time() - wall_start
     h_arr = np.array(all_hic15)
@@ -299,18 +289,16 @@ def run_train(curriculum: bool = False):
         entropy_coeff=cfg["ppo"].get("entropy_coeff", 0.01),
     )
 
-    all_rewards      = []
-    all_hic15        = []
-    all_chest_g      = []
-    all_crit_loss    = []
-    buffer           = []
-    current_stage    = -1
-    last_cl          = float("nan")
-    wall_start       = time.time()
-    ckpt_hic15       = []
-    ckpt_chest_g     = []
+    all_rewards       = []
+    all_hic15         = []
+    all_crit_loss     = []
+    buffer            = []
+    current_stage     = -1
+    last_cl           = float("nan")
+    wall_start        = time.time()
+    ckpt_hic15        = []
     ckpt_is_explosion = []
-    n_explosions     = 0
+    n_explosions      = 0
 
     for ep in range(1, N + 1):
 
@@ -347,14 +335,11 @@ def run_train(curriculum: bool = False):
             ep_reward += reward
             obs = next_obs
 
-        h = ep_info.get("hic15",   float("nan"))
-        c = ep_info.get("chest_g", float("nan"))
+        h = ep_info.get("hic15", float("nan"))
         is_explosion = bool(ep_info.get("is_explosion", False))
         all_rewards.append(ep_reward)
         all_hic15.append(h)
-        all_chest_g.append(c)
         ckpt_hic15.append(h)
-        ckpt_chest_g.append(c)
         ckpt_is_explosion.append(float(is_explosion))
 
         # ── 폭발 에피소드 집계는 플래그와 무관하게 항상 수행 ──────────────
@@ -366,10 +351,9 @@ def run_train(curriculum: bool = False):
 
         # ── 100ep 체크포인트 CSV ───────────────────────────────────────────
         if ep % 100 == 0:
-            _write_checkpoint_csv(csv_path, ep, ckpt_hic15, ckpt_chest_g,
+            _write_checkpoint_csv(csv_path, ep, ckpt_hic15,
                                    explosion_buf=ckpt_is_explosion)
             ckpt_hic15.clear()
-            ckpt_chest_g.clear()
             ckpt_is_explosion.clear()
 
         # ── PPO 업데이트 ───────────────────────────────────────────────────
@@ -383,7 +367,6 @@ def run_train(curriculum: bool = False):
         if ep % log_interval == 0:
             mean_r  = np.nanmean(all_rewards[-log_interval:])
             mean_h  = np.nanmean(all_hic15[-log_interval:])
-            mean_c  = np.nanmean(all_chest_g[-log_interval:])
             elapsed = time.time() - wall_start
             stage_str = f" st={current_stage}" if curriculum else ""
             explosion_rate = n_explosions / ep * 100.0
@@ -391,7 +374,6 @@ def run_train(curriculum: bool = False):
                 f"[{label}] ep {ep:>4}/{N}{stage_str} | "
                 f"mean_r={mean_r:>10.0f} | "
                 f"HIC15={mean_h:>8.0f} | "
-                f"chest_g={mean_c:>6.1f}g | "
                 f"critic_loss={last_cl:.3f} | "
                 f"explosion_rate={explosion_rate:.1f}% | "
                 f"t={elapsed/60:.1f}min",
@@ -401,18 +383,17 @@ def run_train(curriculum: bool = False):
         # ── 주기적 저장 ────────────────────────────────────────────────────
         if ep % save_interval == 0:
             agent.save(f"results/models/{label}_ppo_ep{ep}.pt")
-            _save_logs(label, all_rewards, all_hic15, all_chest_g, all_crit_loss)
+            _save_logs(label, all_rewards, all_hic15, all_crit_loss)
 
     # ── 최종 저장 ──────────────────────────────────────────────────────────
     agent.save(f"results/models/{label}_ppo_final.pt")
-    _save_logs(label, all_rewards, all_hic15, all_chest_g, all_crit_loss)
+    _save_logs(label, all_rewards, all_hic15, all_crit_loss)
 
     elapsed = time.time() - wall_start
     explosion_rate = n_explosions / N * 100.0
     print(f"\n[{label.upper()}] 학습 완료  {N}ep  소요={elapsed/60:.1f}분", flush=True)
     print(f"  mean_reward (전체)  : {np.nanmean(all_rewards):.1f}")
     print(f"  mean_HIC15  (전체)  : {np.nanmean(all_hic15):.0f}")
-    print(f"  mean_chest_g (전체) : {np.nanmean(all_chest_g):.1f}g")
     print(f"  마지막 critic_loss  : {last_cl:.4f}")
     print(f"  폭발 에피소드       : {n_explosions}/{N} ({explosion_rate:.1f}%)"
           f"  exclude_explosions={args.exclude_explosions}", flush=True)
@@ -456,16 +437,14 @@ def run_hybrid_curriculum():
         entropy_coeff=cfg["ppo"].get("entropy_coeff", 0.01),
     )
 
-    all_rewards    = []
-    all_hic15      = []
-    all_chest_g    = []
-    all_crit_loss  = []
-    buffer         = []
-    current_stage  = -1
-    last_cl        = float("nan")
-    wall_start     = time.time()
-    ckpt_hic15     = []
-    ckpt_chest_g   = []
+    all_rewards   = []
+    all_hic15     = []
+    all_crit_loss = []
+    buffer        = []
+    current_stage = -1
+    last_cl       = float("nan")
+    wall_start    = time.time()
+    ckpt_hic15    = []
 
     for ep in range(1, N + 1):
 
@@ -511,19 +490,15 @@ def run_hybrid_curriculum():
             ep_reward += reward
             obs = next_obs
 
-        h = ep_info.get("hic15",   float("nan"))
-        c = ep_info.get("chest_g", float("nan"))
+        h = ep_info.get("hic15", float("nan"))
         all_rewards.append(ep_reward)
         all_hic15.append(h)
-        all_chest_g.append(c)
         ckpt_hic15.append(h)
-        ckpt_chest_g.append(c)
 
         # ── 100ep 체크포인트 CSV ───────────────────────────────────────────
         if ep % 100 == 0:
-            _write_checkpoint_csv(csv_path, ep, ckpt_hic15, ckpt_chest_g)
+            _write_checkpoint_csv(csv_path, ep, ckpt_hic15)
             ckpt_hic15.clear()
-            ckpt_chest_g.clear()
 
         # ── PPO 업데이트 ───────────────────────────────────────────────────
         if len(buffer) >= batch_size:
@@ -536,13 +511,11 @@ def run_hybrid_curriculum():
         if ep % log_interval == 0:
             mean_r  = np.nanmean(all_rewards[-log_interval:])
             mean_h  = np.nanmean(all_hic15[-log_interval:])
-            mean_c  = np.nanmean(all_chest_g[-log_interval:])
             elapsed = time.time() - wall_start
             print(
                 f"[hybrid] ep {ep:>4}/{N} st={current_stage} | "
                 f"mean_r={mean_r:>10.0f} | "
                 f"HIC15={mean_h:>8.0f} | "
-                f"chest_g={mean_c:>6.1f}g | "
                 f"critic_loss={last_cl:.3f} | "
                 f"t={elapsed/60:.1f}min",
                 flush=True,
@@ -551,11 +524,11 @@ def run_hybrid_curriculum():
         # ── 주기적 저장 ────────────────────────────────────────────────────
         if ep % save_interval == 0:
             agent.save(f"results/models/{label}_ppo_ep{ep}.pt")
-            _save_logs(label, all_rewards, all_hic15, all_chest_g, all_crit_loss)
+            _save_logs(label, all_rewards, all_hic15, all_crit_loss)
 
     # ── 최종 저장 ──────────────────────────────────────────────────────────
     agent.save(f"results/models/{label}_ppo_final.pt")
-    _save_logs(label, all_rewards, all_hic15, all_chest_g, all_crit_loss)
+    _save_logs(label, all_rewards, all_hic15, all_crit_loss)
 
     elapsed = time.time() - wall_start
     h_arr = np.array(all_hic15)
@@ -563,17 +536,15 @@ def run_hybrid_curriculum():
     print(f"\n[HYBRID_CURRICULUM] 학습 완료  {N}ep  label={label}  소요={elapsed/60:.1f}분", flush=True)
     print(f"  mean_reward (전체)  : {np.nanmean(all_rewards):.1f}")
     print(f"  HIC15 median (전체) : {np.median(h_f) if len(h_f) else float('nan'):.0f}")
-    print(f"  mean_chest_g (전체) : {np.nanmean(all_chest_g):.1f}g")
     print(f"  마지막 critic_loss  : {last_cl:.4f}", flush=True)
 
     env.close()
     sim_app.close()
 
 
-def _save_logs(label, rewards, hic15, chest_g, crit_loss):
-    np.save(f"results/logs/{label}_ppo_rewards.npy",   rewards)
-    np.save(f"results/logs/{label}_ppo_hic15.npy",     hic15)
-    np.save(f"results/logs/{label}_ppo_chest_g.npy",   chest_g)
+def _save_logs(label, rewards, hic15, crit_loss):
+    np.save(f"results/logs/{label}_ppo_rewards.npy",     rewards)
+    np.save(f"results/logs/{label}_ppo_hic15.npy",       hic15)
     np.save(f"results/logs/{label}_ppo_critic_loss.npy", crit_loss)
 
 

@@ -37,12 +37,11 @@ WALL_DIST_M = 3.5
 WALL_SIZE   = np.array([0.5, 5.0, 3.0])
 WALL_POS_Z  = 1.5
 
-# HIC15/chest_g가 이 값을 넘으면 물리적으로 불가능한 수치 폭발(NaN 직전 상태)로 간주.
+# HIC15가 이 값을 넘으면 물리적으로 불가능한 수치 폭발(NaN 직전 상태)로 간주.
 # 실제 인체 손상 기준(HIC_SAFE=700)과는 무관 — 시뮬레이션 안정성 판단용 임계값.
-# 1000ep 학습 로그의 log-scale gap 분석(results/comparison/hic15_histogram.png,
-# chestg_histogram.png)에서 저위험/고위험 클러스터 사이 최대 gap 지점으로 산출.
-EXPLOSION_HIC_THRESHOLD   = 270_000
-EXPLOSION_CHEST_THRESHOLD = 3_885
+# 정상 에피소드(<100,000) 내부 분포 분석 결과 10K~20K에 메인 클러스터가
+# 집중(results/comparison/normal_hic_distribution.png)되어 있어 20,000으로 조정.
+EXPLOSION_HIC_THRESHOLD = 20_000
 
 # compliant contact (crumple zone 등가 재질)
 _CONTACT_STIFFNESS = 4.5e5  # N/m  — 차량 크럼플존 등가 스프링 강성 (2e5→4.5e5 조정)
@@ -221,7 +220,6 @@ class AirbagEnv(gym.Env):
         # Dense reward: 이번 스텝 윈도우 (~17ms)
         reward = compute_step_reward(
             head_acc_g        = self.collector.head_acc_g[prev_count:curr_count],
-            torso_acc_g       = self.collector.torso_acc_g[prev_count:curr_count],
             dt                = PHYSICS_DT,
             deploy_flags      = deploy_flags,
             n_steps           = COLLISION_STEPS,
@@ -251,7 +249,7 @@ class AirbagEnv(gym.Env):
             nij         = compute_nij(self.collector.head_acc_3d)
 
             terminal_reward = compute_reward(
-                hic15=hic15, chest_g=chest_g,
+                hic15=hic15,
                 deploy_flags      = deploy_flags,
                 violation_coeff   = self.violation_coeff,
                 angle             = float(self.scenario.get("angle", 0.0)),
@@ -275,12 +273,9 @@ class AirbagEnv(gym.Env):
                 "femur_n":              femur_n,
                 "nij":                  nij,
                 "deploy_count":         int(sum(deploy_flags)),
-                # HIC15 또는 chest_g가 수치 폭발 임계값을 넘거나 비유한이면 True —
-                # 학습 루프에서 이 에피소드를 buffer에서 제외할지 판단하는 데 사용.
-                "is_explosion":         bool(
-                    (not np.isfinite(hic15)) or hic15 > EXPLOSION_HIC_THRESHOLD
-                    or (not np.isfinite(chest_g)) or chest_g > EXPLOSION_CHEST_THRESHOLD
-                ),
+                # HIC15가 수치 폭발 임계값을 넘거나 비유한이면 True — 학습
+                # 루프에서 이 에피소드를 buffer에서 제외할지 판단하는 데 사용.
+                "is_explosion":         bool((not np.isfinite(hic15)) or hic15 > EXPLOSION_HIC_THRESHOLD),
             }
 
         obs = self.sampler.to_state_vector(self.scenario)

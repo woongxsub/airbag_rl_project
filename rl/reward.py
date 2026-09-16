@@ -377,7 +377,6 @@ def compute_peak_penalty(
 
 def compute_reward(
     hic15:              float,
-    chest_g:            float,
     deploy_flags:       list  = None,
     violation_coeff:    float = _VIOLATION_COEFF,
     # ── 하이브리드 커리큘럼 신규 파라미터 (기본=0 → 구 코드와 완전 호환) ──
@@ -397,28 +396,22 @@ def compute_reward(
 ) -> float:
     """
     에피소드 종료 시 전체 이력 기반 터미널 보상.
-    base      = -∑(val/safe)²  — 연속 gradient, 기준 근접 시 관대
-    violation = -coeff×(초과율)² — 기준 초과 시 가속적 패널티
-    bonus     = +2.0            — 2개 지표 전부 기준 이하
-    no_deploy = -2.0            — 에어백 미전개
+    base      = -(HIC15/HIC_SAFE)²  — 연속 gradient, 기준 근접 시 관대
+    violation = -coeff×(초과율)²     — 기준 초과 시 가속적 패널티
+    bonus     = +2.0                 — HIC15 기준 이하
+    no_deploy = -2.0                 — 에어백 미전개
     + 방향일치 / 과전개 / 타이밍 / 피크 항 (가중치=0이면 skip)
     """
-    if not (np.isfinite(hic15) and np.isfinite(chest_g)):
+    if not np.isfinite(hic15):
         return -1000.0
 
-    metrics = [
-        (hic15,   HIC_SAFE),
-        (chest_g, CHEST_G_SAFE),
-    ]
+    r = -(hic15 / HIC_SAFE) ** 2
 
-    r = sum(-(val / safe) ** 2 for val, safe in metrics)
+    if hic15 > HIC_SAFE:
+        excess = hic15 / HIC_SAFE - 1.0
+        r -= violation_coeff * excess ** 2
 
-    for val, safe in metrics:
-        if val > safe:
-            excess = val / safe - 1.0
-            r -= violation_coeff * excess ** 2
-
-    if all(val <= safe for val, safe in metrics):
+    if hic15 <= HIC_SAFE:
         r += _SAFETY_BONUS
 
     if deploy_flags is not None and sum(deploy_flags) == 0:
@@ -446,7 +439,6 @@ def compute_reward(
 
 def compute_step_reward(
     head_acc_g:         list,
-    torso_acc_g:        list,
     dt:                 float,
     deploy_flags:       list  = None,
     n_steps:            int   = 60,
@@ -469,27 +461,20 @@ def compute_step_reward(
     방향/타이밍 항도 동일 스케일 적용 (dense feedback).
     peak_penalty는 에피소드 전체 최대값 필요 → 터미널 보상에서만 계산.
     """
-    if not head_acc_g and not torso_acc_g:
+    if not head_acc_g:
         return 0.0
 
-    hic15   = compute_hic15(head_acc_g, dt)
-    chest_g = float(max(torso_acc_g)) if torso_acc_g else 0.0
+    hic15 = compute_hic15(head_acc_g, dt)
 
-    if not (np.isfinite(hic15) and np.isfinite(chest_g)):
+    if not np.isfinite(hic15):
         return 0.0
-
-    metrics = [
-        (hic15,   HIC_SAFE),
-        (chest_g, CHEST_G_SAFE),
-    ]
 
     scale = 1.0 / n_steps
-    r = sum(-(val / safe) ** 2 for val, safe in metrics) * scale
+    r = -(hic15 / HIC_SAFE) ** 2 * scale
 
-    for val, safe in metrics:
-        if val > safe:
-            excess = val / safe - 1.0
-            r -= violation_coeff * excess ** 2 * scale
+    if hic15 > HIC_SAFE:
+        excess = hic15 / HIC_SAFE - 1.0
+        r -= violation_coeff * excess ** 2 * scale
 
     if deploy_flags is not None and sum(deploy_flags) == 0:
         r -= _NO_DEPLOY_PEN * scale
