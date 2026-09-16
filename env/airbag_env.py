@@ -22,7 +22,7 @@ from env.airbag import AirbagSystem
 from env.scenario import ScenarioSampler, STATE_DIM, SPINE_TILT_MIN_DEG, SPINE_TILT_MAX_DEG
 from rl.reward import (
     InjuryDataCollector,
-    compute_hic15, compute_chest_g, compute_chest_3ms_clip,
+    compute_hic15, compute_chest_3ms_clip,
     compute_chest_compression_mm, compute_femur_force_n, compute_nij,
     compute_reward, compute_step_reward,
 )
@@ -53,7 +53,7 @@ class AirbagEnv(gym.Env):
     State  : 11차원 (실차 센서 측정 가능한 값만, scenario.STATE_DIM=11)
     Action : 15차원 (에어백 5개 × [deploy, timing, pressure])
     Reward : Dense (스텝마다) + Terminal (에피소드 종료 시 bonus/penalty)
-             안전 지표 5개: HIC15, Nij, chest_g, chest_3ms, chest_compression_mm
+             안전 지표 4개: HIC15, Nij, chest_3ms, chest_compression_mm
     """
 
     def __init__(self, headless: bool = True, debug: bool = False,
@@ -240,7 +240,6 @@ class AirbagEnv(gym.Env):
         if done:
             dt          = PHYSICS_DT
             hic15       = compute_hic15(self.collector.head_acc_g, dt)
-            chest_g     = compute_chest_g(self.collector.torso_acc_g)
             chest_3ms   = compute_chest_3ms_clip(self.collector.torso_acc_g, dt)
             compression = compute_chest_compression_mm(
                 self.collector.torso_pos_history,
@@ -267,7 +266,6 @@ class AirbagEnv(gym.Env):
             reward += terminal_reward
             info = {
                 "hic15":                hic15,
-                "chest_g":              chest_g,
                 "chest_3ms":            chest_3ms,
                 "chest_compression_mm": compression,
                 "femur_n":              femur_n,

@@ -91,8 +91,8 @@ def get_hybrid_stage(ep: int, total: int) -> dict:
 
     Stage | ep 범위       | 분포                     | vc   | correct | wrong | over | late | peak
     ------+---------------+--------------------------+------+---------+-------+------+------+-----
-      1   | 1 ~ 25%      | 정면±45°, 30-60 km/h     | 2.0  | 0.30    | 0.20  | 0.10 | 0.20 | 0.0
-      2   | 25% ~ 50%    | 전 각도,   30-90 km/h    | 5.0  | 0.15    | 0.10  | 0.05 | 0.10 | 1.0
+      1   | 1 ~ 25%      | 정면±45°, 30-60 km/h     | 2.0  | 0.30    | 0.20  | 0.10 | 0.10 | 0.0
+      2   | 25% ~ 50%    | 전 각도,   30-90 km/h    | 5.0  | 0.15    | 0.10  | 0.05 | 0.05 | 1.0
       3   | 50% ~ 75%    | 전 각도,  20-120 km/h    | 8.0  | 0.00    | 0.00  | 0.00 | 0.00 | 2.0
       4   | 75% ~ 100%   | 전 각도,  20-120 km/h    | 10.0 | 0.00    | 0.00  | 0.00 | 0.00 | 3.0
     """
@@ -100,11 +100,11 @@ def get_hybrid_stage(ep: int, total: int) -> dict:
     if pct <= 0.25:
         return dict(stage=1, violation_coeff=2.0,
                     correct_weight=0.30, wrong_weight=0.20,
-                    over_weight=0.10,   late_weight=0.20, peak_weight=0.0)
+                    over_weight=0.10,   late_weight=0.10, peak_weight=0.0)
     elif pct <= 0.50:
         return dict(stage=2, violation_coeff=5.0,
                     correct_weight=0.15, wrong_weight=0.10,
-                    over_weight=0.05,   late_weight=0.10, peak_weight=1.0)
+                    over_weight=0.05,   late_weight=0.05, peak_weight=1.0)
     elif pct <= 0.75:
         return dict(stage=3, violation_coeff=8.0,
                     correct_weight=0.0,  wrong_weight=0.0,

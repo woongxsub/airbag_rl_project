@@ -4,7 +4,7 @@
 물리 데이터 흐름:
   physics_callback (1ms) → InjuryDataCollector.record()
       head_vel  → 수치미분 → head_acc_3d  → HIC15, Nij
-      torso_vel → 수치미분 → torso_acc_g  → chest_g, chest_3ms_clip
+      torso_vel → 수치미분 → torso_acc_g  → chest_3ms_clip
       torso_pos → 위치이력              → chest_compression
       thigh_vel → 수치미분 → thigh_acc_3d → femur_force
 """
@@ -15,7 +15,7 @@ from scipy.ndimage import minimum_filter1d
 # ── NHTSA / FMVSS 안전 기준선 ────────────────────────────────────────────
 HIC_SAFE               = 700.0
 CHEST_G_SAFE           = 60.0    # 흉부 최대 합성가속도 (g)
-CHEST_3MS_SAFE         = 60.0    # 흉부 3ms 클립 (g)            — 현재 보상함수 미사용 (chest_g 중복), 로깅용 유지
+CHEST_3MS_SAFE         = 60.0    # 흉부 3ms 클립 (g)            — 현재 보상함수 미사용, 로깅용 유지
 CHEST_COMPRESSION_SAFE = 50.0    # 흉부 압축량 (mm)             — 현재 보상함수 미사용 (측정 한계), 로깅용 유지
 FEMUR_SAFE             = 10_000.0 # 대퇴부 압축력 (N)            — 현재 무릎 에어백 미구현으로 보상함수에서 제외, 로깅용 유지
 NIJ_SAFE               = 1.0     # 목 상해 지수 Nij              — 현재 보상함수 미사용 (HIC15 중복), 로깅용 유지
@@ -165,18 +165,12 @@ def compute_hic15(acc_g: list, dt: float) -> float:
 # 3. 신체 부위별 지표
 # ══════════════════════════════════════════════════════════════════════════
 
-def compute_chest_g(torso_acc_g: list) -> float:
-    """흉부 최대 합성 가속도 (g). 기준 60g."""
-    return float(max(torso_acc_g)) if torso_acc_g else 0.0
-
-
 def compute_chest_3ms_clip(torso_acc_g: list, dt: float) -> float:
     """
     흉부 3ms 클립 가속도: 최소 3ms 연속 지속되는 최고 가속도 (g).
     슬라이딩 윈도우 최솟값의 최댓값으로 구현 (scipy.ndimage).
 
-    현재 보상함수에서는 미사용 (chest_g와 동일 원천 데이터 파생, 중복성 높음).
-    로깅/분석용으로만 유지.
+    현재 보상함수에서는 미사용. 로깅/분석용으로만 유지.
     """
     arr = np.asarray(torso_acc_g, dtype=np.float64)
     if len(arr) == 0:
